@@ -184,6 +184,29 @@ def load_quantized_state_dict(
                         detected_format = "mxfp8"
                     elif algo in ("nvfp4",):
                         detected_format = "nvfp4"
+                    elif quant_meta:
+                        # Fallback for mixed precision where `algorithm` might not be at the root or correctly mapped
+                        # Check if formats like nvfp4 or mxfp8 are explicitly named in the individual layer formats
+                        layers_dict = quant_meta.get("layers", quant_meta)
+                        for layer_key, layer_info in layers_dict.items():
+                            if isinstance(layer_info, dict):
+                                fmt = layer_info.get("format", None)
+                                if fmt == "int8_tensorwise":
+                                    detected_format = "int8_tensorwise"
+                                elif fmt == "int8_blockwise" or fmt == "int8":
+                                    detected_format = "int8_blockwise"
+                                elif fmt == "float8_e4m3fn_blockwise":
+                                    detected_format = "float8_e4m3fn_blockwise"
+                                elif fmt == "float8_e4m3fn_rowwise":
+                                    detected_format = "float8_e4m3fn_rowwise"
+                                elif fmt == "mxfp8":
+                                    detected_format = "mxfp8"
+                                elif fmt == "nvfp4":
+                                    detected_format = "nvfp4"
+                                elif fmt in ["float8_e4m3fn", "float8_e5m2"]:
+                                    detected_format = "float8_e4m3fn"
+                                if detected_format != "unknown":
+                                    break
                 except (json.JSONDecodeError, TypeError):
                     pass
 
@@ -356,6 +379,27 @@ def detect_quant_format(filepath: str) -> str:
             return "mxfp8"
         elif algo in ("nvfp4",):
             return "nvfp4"
+        elif quant_meta:
+            # Fallback for mixed precision where `algorithm` might not be at the root or correctly mapped
+            # Check if formats like nvfp4 or mxfp8 are explicitly named in the individual layer formats
+            layers_dict = quant_meta.get("layers", quant_meta)
+            for layer_key, layer_info in layers_dict.items():
+                if isinstance(layer_info, dict):
+                    fmt = layer_info.get("format", None)
+                    if fmt == "int8_tensorwise":
+                        return "int8_tensorwise"
+                    elif fmt == "int8_blockwise" or fmt == "int8":
+                        return "int8_blockwise"
+                    elif fmt == "float8_e4m3fn_blockwise":
+                        return "float8_e4m3fn_blockwise"
+                    elif fmt == "float8_e4m3fn_rowwise":
+                        return "float8_e4m3fn_rowwise"
+                    elif fmt == "mxfp8":
+                        return "mxfp8"
+                    elif fmt == "nvfp4":
+                        return "nvfp4"
+                    elif fmt in ["float8_e4m3fn", "float8_e5m2"]:
+                        return "float8_e4m3fn"
 
     # Try reading per-layer comfy_quant metadata
     try:

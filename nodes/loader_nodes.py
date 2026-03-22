@@ -53,6 +53,8 @@ class QuantizedModelLoader:
         self, ckpt_name, quant_format, kernel_backend, disable_dynamic
     ):
         """Load a checkpoint with the specified quantization format and kernel backend."""
+        import json
+        from ..utils.safetensors_loader import load_quantized_state_dict
 
         # Set the kernel backend for INT8 blockwise layout (only affects blockwise)
         if quant_format == "int8":
@@ -82,22 +84,26 @@ class QuantizedModelLoader:
             except ImportError as e:
                 logging.warning(f"UnifiedQuantOps not available: {e}")
 
-        # Load state dict
+        # Load state dict using our custom loader to get a clean state_dict
+        sd, detected_format, metadata = load_quantized_state_dict(ckpt_path, device="cpu")
+        
+        # If auto, set the ops class now
         if quant_format == "auto":
-            # Auto mode: fast header-only detection, then standard loading
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                detected_format = detect_quant_format(ckpt_path)
-                logging.info(f"QuantizedModelLoader: Auto-detected format: {detected_format}")
+            logging.info(f"QuantizedModelLoader: Auto-detected format: {detected_format}")
+            from ..unified_ops import UnifiedQuantOps
+            model_options = {"custom_operations": UnifiedQuantOps}
 
-                # Unconditionally use UnifiedQuantOps so we handle mixed formats perfectly
-                from ..unified_ops import UnifiedQuantOps
-                model_options = {"custom_operations": UnifiedQuantOps}
-            except Exception as e:
-                logging.warning(f"QuantizedModelLoader: Format detection failed: {e}")
-
-        # Standard loading - ComfyUI handles it
-        sd, metadata = comfy.utils.load_torch_file(ckpt_path, safe_load=True, return_metadata=True)
+        # Manually inject comfy_quant tensors from metadata to control the loading process
+        # and prevent Comfy's core from overriding our custom ops.
+        if metadata and "_quantization_metadata" in metadata:
+            quant_metadata = json.loads(metadata["_quantization_metadata"])
+            layers = quant_metadata.get("layers", quant_metadata)
+            for k, v in layers.items():
+                sd["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode('utf-8')), dtype=torch.uint8)
+            # Pass empty metadata to the core loader to prevent it from detecting mixed precision and overriding our ops
+            metadata = {}
+        else:
+            metadata = {}
 
         # Build model from state dict
         try:
@@ -171,6 +177,8 @@ class QuantizedUNETLoader:
 
     def load_unet(self, unet_name, quant_format, kernel_backend, disable_dynamic):
         """Load a UNET model with the specified settings."""
+        import json
+        from ..utils.safetensors_loader import load_quantized_state_dict
 
         # Set kernel backend (only for INT8 blockwise format)
         if quant_format == "int8":
@@ -198,22 +206,26 @@ class QuantizedUNETLoader:
             except ImportError as e:
                 logging.warning(f"UnifiedQuantOps not available: {e}")
 
-        # Load state dict
+        # Load state dict using our custom loader to get a clean state_dict
+        sd, detected_format, metadata = load_quantized_state_dict(unet_path, device="cpu")
+
+        # If auto, set the ops class now
         if quant_format == "auto":
-            # Auto mode: fast header-only detection, then standard loading
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                detected_format = detect_quant_format(unet_path)
-                logging.info(f"QuantizedUNETLoader: Auto-detected format: {detected_format}")
-
-                # Unconditionally use UnifiedQuantOps so we handle mixed formats perfectly
-                from ..unified_ops import UnifiedQuantOps
-                model_options = {"custom_operations": UnifiedQuantOps}
-            except Exception as e:
-                logging.warning(f"QuantizedUNETLoader: Format detection failed: {e}")
-
-        # Standard loading - ComfyUI handles it
-        sd, metadata = comfy.utils.load_torch_file(unet_path, safe_load=True, return_metadata=True)
+            logging.info(f"QuantizedUNETLoader: Auto-detected format: {detected_format}")
+            from ..unified_ops import UnifiedQuantOps
+            model_options = {"custom_operations": UnifiedQuantOps}
+        
+        # Manually inject comfy_quant tensors from metadata to control the loading process
+        # and prevent Comfy's core from overriding our custom ops.
+        if metadata and "_quantization_metadata" in metadata:
+            quant_metadata = json.loads(metadata["_quantization_metadata"])
+            layers = quant_metadata.get("layers", quant_metadata)
+            for k, v in layers.items():
+                sd["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode('utf-8')), dtype=torch.uint8)
+            # Pass empty metadata to the core loader to prevent it from detecting mixed precision and overriding our ops
+            metadata = {}
+        else:
+            metadata = {}
 
         # Build model from state dict
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata, disable_dynamic=disable_dynamic)
@@ -277,6 +289,8 @@ class QuantizedCLIPLoader:
     def load_clip(self, clip_name, type, quant_format, kernel_backend, disable_dynamic):
         """Load a CLIP/text encoder with quantization support."""
         import comfy.model_management
+        import json
+        from ..utils.safetensors_loader import load_quantized_state_dict
 
         # Configure INT8 kernel backend (only affects INT8 blockwise models)
         if quant_format == "int8":
@@ -303,36 +317,29 @@ class QuantizedCLIPLoader:
         model_options = {
             "initial_device": comfy.model_management.text_encoder_offload_device()
         }
+        
+        # Use our custom loader
+        sd, detected_format, metadata = load_quantized_state_dict(clip_path, device="cpu")
 
         # Load state dict based on format
         if quant_format == "auto":
-            # Auto mode: fast header-only detection, then standard loading
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                detected_format = detect_quant_format(clip_path)
-                logging.info(f"QuantizedCLIPLoader: Auto-detected format: {detected_format}")
-
-                # Select ops based on detected format
-                if detected_format == "int8_tensorwise":
-                    pass # Handled natively by ComfyUI
-                else:
-                    from ..unified_ops import UnifiedQuantOps
-                    model_options["custom_operations"] = UnifiedQuantOps
-            except Exception as e:
-                logging.warning(f"QuantizedCLIPLoader: Format detection failed: {e}")
-
-            # Standard loading - ComfyUI handles it
-            sd, metadata = comfy.utils.load_torch_file(clip_path, safe_load=True, return_metadata=True)
+            logging.info(f"QuantizedCLIPLoader: Auto-detected format: {detected_format}")
+            from ..unified_ops import UnifiedQuantOps
+            model_options["custom_operations"] = UnifiedQuantOps
         else:
-            # Explicit format: set ops and load
-            sd, metadata = comfy.utils.load_torch_file(clip_path, safe_load=True, return_metadata=True)
+            from ..unified_ops import UnifiedQuantOps
+            model_options["custom_operations"] = UnifiedQuantOps
+            logging.info(f"QuantizedCLIPLoader: Using UnifiedQuantOps for {quant_format}")
 
-            try:
-                from ..unified_ops import UnifiedQuantOps
-                model_options["custom_operations"] = UnifiedQuantOps
-                logging.info(f"QuantizedCLIPLoader: Using UnifiedQuantOps for {quant_format}")
-            except ImportError as e:
-                logging.warning(f"UnifiedQuantOps not available: {e}")
+        # Manually inject comfy_quant tensors and clear metadata to prevent override
+        if metadata and "_quantization_metadata" in metadata:
+            quant_metadata = json.loads(metadata["_quantization_metadata"])
+            layers = quant_metadata.get("layers", quant_metadata)
+            for k, v in layers.items():
+                sd["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode('utf-8')), dtype=torch.uint8)
+            metadata = {}
+        else:
+            metadata = {}
 
         # Load text encoder using ComfyUI's API
         clip = comfy.sd.load_text_encoder_state_dicts(
@@ -405,6 +412,8 @@ class QuantizedDualCLIPLoader:
     def load_clip(self, text_encoder1, text_encoder2, type, quant_format, kernel_backend, disable_dynamic):
         """Load two text encoders with quantization support."""
         import comfy.model_management
+        import json
+        from ..utils.safetensors_loader import load_quantized_state_dict
 
         # Configure INT8 kernel backend (only affects INT8 blockwise models)
         if quant_format == "int8":
@@ -438,36 +447,27 @@ class QuantizedDualCLIPLoader:
             "initial_device": comfy.model_management.text_encoder_offload_device()
         }
 
-        # Load both state dicts
-        sd1, metadata1 = comfy.utils.load_torch_file(clip_path1, safe_load=True, return_metadata=True)
-        sd2, metadata2 = comfy.utils.load_torch_file(clip_path2, safe_load=True, return_metadata=True)
+        # Load both state dicts using our custom loader
+        sd1, _, metadata1 = load_quantized_state_dict(clip_path1, device="cpu")
+        sd2, _, metadata2 = load_quantized_state_dict(clip_path2, device="cpu")
 
-        # Set ops based on quant_format
-        if quant_format == "auto":
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                # Detect from first encoder (primary); second may differ
-                detected_format = detect_quant_format(clip_path1)
-                logging.info(f"QuantizedDualCLIPLoader: Auto-detected format (encoder1): {detected_format}")
+        # Set ops class unconditionally for unified handling
+        from ..unified_ops import UnifiedQuantOps
+        model_options["custom_operations"] = UnifiedQuantOps
 
-                from ..unified_ops import UnifiedQuantOps
-                model_options["custom_operations"] = UnifiedQuantOps
+        # Manually inject comfy_quant for sd1
+        if metadata1 and "_quantization_metadata" in metadata1:
+            quant_metadata = json.loads(metadata1["_quantization_metadata"])
+            layers = quant_metadata.get("layers", quant_metadata)
+            for k, v in layers.items():
+                sd1["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode('utf-8')), dtype=torch.uint8)
 
-                # Also check second encoder if first didn't set ops
-                if "custom_operations" not in model_options:
-                    detected_format2 = detect_quant_format(clip_path2)
-                    logging.info(f"QuantizedDualCLIPLoader: Auto-detected format (encoder2): {detected_format2}")
-                    from ..unified_ops import UnifiedQuantOps
-                    model_options["custom_operations"] = UnifiedQuantOps
-            except Exception as e:
-                logging.warning(f"QuantizedDualCLIPLoader: Format detection failed: {e}")
-        else:
-            try:
-                from ..unified_ops import UnifiedQuantOps
-                model_options["custom_operations"] = UnifiedQuantOps
-                logging.info(f"QuantizedDualCLIPLoader: Using UnifiedQuantOps for {quant_format}")
-            except ImportError as e:
-                logging.warning(f"UnifiedQuantOps not available: {e}")
+        # Manually inject comfy_quant for sd2
+        if metadata2 and "_quantization_metadata" in metadata2:
+            quant_metadata = json.loads(metadata2["_quantization_metadata"])
+            layers = quant_metadata.get("layers", quant_metadata)
+            for k, v in layers.items():
+                sd2["{}.comfy_quant".format(k)] = torch.tensor(list(json.dumps(v).encode('utf-8')), dtype=torch.uint8)
 
         # Load dual text encoders using ComfyUI's API
         clip = comfy.sd.load_text_encoder_state_dicts(

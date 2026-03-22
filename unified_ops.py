@@ -97,10 +97,12 @@ class UnifiedQuantOps(manual_cast):
 
             if comfy_quant_tensor is not None:
                 try:
-                    layer_conf = json.loads(comfy_quant_tensor.numpy().tobytes())
+                    # Robust parsing without numpy triggering warnings
+                    byte_data = bytes(comfy_quant_tensor.tolist())
+                    json_str = byte_data.decode("utf-8")
+                    layer_conf = json.loads(json_str)
                 except Exception as e:
-                    # Fallback to tensor_to_dict
-                    layer_conf = tensor_to_dict(comfy_quant_tensor)
+                    logging.debug(f"Failed to parse comfy_quant metadata: {e}")
 
             self.quant_format = layer_conf.get("format", None)
             self.block_size = layer_conf.get("group_size", None)
@@ -135,11 +137,26 @@ class UnifiedQuantOps(manual_cast):
                     else:
                         orig_shape = (weight_tensor.shape[0], weight_tensor.shape[1] * 2)
                     
+                    # For NVFP4, scale is block_scale (float8_e4m3fn), scale_2 is tensor_scale (float32)
+                    tensor_scale = scale_2.to(torch.float32) if scale_2 is not None else torch.tensor(1.0)
+                    
+                    if scale is not None:
+                        # scale corresponds to block_scale, but verify dtype based on shape and name if necessary
+                        if scale.dtype == torch.uint8:
+                            block_scale = scale.view(torch.float8_e4m3fn)
+                        elif scale.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                             # Comfy core converts scales back sometimes, or it was loaded with force_scale_float32
+                             block_scale = scale.to(torch.float8_e4m3fn)
+                        else:
+                            block_scale = scale
+                    else:
+                        block_scale = None
+                    
                     layout_params = TensorCoreNVFP4Layout.Params(
-                        scale=scale_2.to(torch.float32) if scale_2 is not None else torch.tensor(1.0),
+                        scale=tensor_scale,
                         orig_dtype=orig_dtype,
                         orig_shape=orig_shape,
-                        block_scale=scale,
+                        block_scale=block_scale,
                     )
                     
                     self.weight = torch.nn.Parameter(
@@ -256,8 +273,17 @@ class UnifiedQuantOps(manual_cast):
                         )
                     else:
                         from comfy.quant_ops import TensorCoreFP8Layout
+                        
+                        # Standard FP8 expects scale to be a float32 scalar tensor, defaulting to 1.0 if missing
+                        if scale is None:
+                            scale = torch.ones((), dtype=torch.float32)
+                        elif not isinstance(scale, torch.Tensor):
+                            scale = torch.tensor(scale, dtype=torch.float32)
+                        else:
+                            scale = scale.to(torch.float32)
+                            
                         layout_params = TensorCoreFP8Layout.Params(
-                            scale=scale.to(torch.float32) if scale is not None else None,
+                            scale=scale,
                             orig_dtype=torch.bfloat16, orig_shape=tuple(weight_tensor.shape),
                         )
 
