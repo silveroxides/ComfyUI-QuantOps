@@ -6,7 +6,7 @@ any mix of INT8, FP8, MXFP8, and NVFP4 quantized layers in the same model.
 It relies on per-tensor layout parameters from comfy_quant metadata and uses 
 QuantizedTensor dispatch to avoid dequantization whenever possible.
 """
-
+import os
 import json
 import torch
 import logging
@@ -288,9 +288,9 @@ class UnifiedQuantOps(manual_cast):
 
             input_dtype = input.dtype
 
-            from . import global_state
+            disable_dynamic = os.environ.get("COMFYUI_QUANTOPS_DISABLE_DYNAMIC", "False") == "True"
             
-            if not getattr(global_state, "DISABLE_DYNAMIC", False):
+            if not disable_dynamic:
                 is_quantized_fast_path = isinstance(weight, QuantizedTensor)
                 cast_dtype = weight.dtype if is_quantized_fast_path else None
                 cast_bias_dtype = input_dtype if is_quantized_fast_path else None
@@ -304,14 +304,14 @@ class UnifiedQuantOps(manual_cast):
                 )
 
             if isinstance(weight, QuantizedTensor):
-                if getattr(global_state, "DISABLE_DYNAMIC", False):
+                if disable_dynamic:
                     if weight.device != input.device:
                         weight = weight.to(device=input.device)
                 
                 if hasattr(weight, "_params"):
                     object.__setattr__(weight._params, "orig_dtype", input_dtype)
 
-                if getattr(global_state, "DISABLE_DYNAMIC", False):
+                if disable_dynamic:
                     bias = self.bias
                     if bias is not None:
                         bias = bias.to(device=input.device, dtype=input_dtype)
@@ -335,17 +335,17 @@ class UnifiedQuantOps(manual_cast):
                         if tensor_3d:
                             output = output.reshape(input_shape[0], input_shape[1], -1)
                         if input.dtype == torch.float32:
-                            if getattr(global_state, "DISABLE_DYNAMIC", False):
+                            if disable_dynamic:
                                 return output.to(torch.float32)
                             else:
                                 out = output.to(torch.float32)
                         else:
-                            if getattr(global_state, "DISABLE_DYNAMIC", False):
+                            if disable_dynamic:
                                 return output
                             else:
                                 out = output
                     else:
-                        if getattr(global_state, "DISABLE_DYNAMIC", False):
+                        if disable_dynamic:
                             return torch.nn.functional.linear(input.reshape(input_shape), weight.dequantize(), bias)
                         else:
                             out = torch.nn.functional.linear(input.reshape(input_shape), weight.dequantize(), bias)
@@ -369,17 +369,17 @@ class UnifiedQuantOps(manual_cast):
                         if tensor_3d:
                             output = output.reshape(input_shape[0], input_shape[1], -1)
                         if input.dtype == torch.float32:
-                            if getattr(global_state, "DISABLE_DYNAMIC", False):
+                            if disable_dynamic:
                                 return output.to(torch.float32)
                             else:
                                 out = output.to(torch.float32)
                         else:
-                            if getattr(global_state, "DISABLE_DYNAMIC", False):
+                            if disable_dynamic:
                                 return output
                             else:
                                 out = output
                     else:
-                        if getattr(global_state, "DISABLE_DYNAMIC", False):
+                        if disable_dynamic:
                             return torch.nn.functional.linear(input.reshape(input_shape), weight.dequantize(), bias)
                         else:
                             out = torch.nn.functional.linear(input.reshape(input_shape), weight.dequantize(), bias)
@@ -403,30 +403,30 @@ class UnifiedQuantOps(manual_cast):
                         if tensor_3d:
                             output = output.reshape(input_shape[0], input_shape[1], -1)
                         if input.dtype == torch.float32:
-                            if getattr(global_state, "DISABLE_DYNAMIC", False):
+                            if disable_dynamic:
                                 return output.to(torch.float32)
                             else:
                                 out = output.to(torch.float32)
                         else:
-                            if getattr(global_state, "DISABLE_DYNAMIC", False):
+                            if disable_dynamic:
                                 return output
                             else:
                                 out = output
                     else:
-                        if getattr(global_state, "DISABLE_DYNAMIC", False):
+                        if disable_dynamic:
                             return torch.nn.functional.linear(input.reshape(input_shape), weight.dequantize(), bias)
                         else:
                             out = torch.nn.functional.linear(input.reshape(input_shape), weight.dequantize(), bias)
 
                 else:
                     # Default trigger for QuantizedTensor dispatch -> layout-specific handler
-                    if getattr(global_state, "DISABLE_DYNAMIC", False):
+                    if disable_dynamic:
                         return torch.nn.functional.linear(input, weight, bias)
                     else:
                         out = torch.nn.functional.linear(input, weight, bias)
 
             else:
-                if getattr(global_state, "DISABLE_DYNAMIC", False):
+                if disable_dynamic:
                     # Fallback path if it's not wrapped in QuantizedTensor
                     if self.is_quantized:
                         weight = weight.to(device=input.device)
@@ -437,7 +437,7 @@ class UnifiedQuantOps(manual_cast):
                 else:
                     out = torch.nn.functional.linear(input, weight, bias)
 
-            if not getattr(global_state, "DISABLE_DYNAMIC", False) or not isinstance(weight, QuantizedTensor):
+            if not disable_dynamic or not isinstance(weight, QuantizedTensor):
                 uncast_bias_weight(self, weight, bias, offload_stream)
             return out
 

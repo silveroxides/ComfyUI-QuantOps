@@ -8,6 +8,7 @@ These nodes provide custom model loading with:
 """
 
 import logging
+import os
 import torch
 import folder_paths
 import comfy.sd
@@ -99,8 +100,7 @@ class QuantizedModelLoader:
         # Standard loading - ComfyUI handles it
         sd, metadata = comfy.utils.load_torch_file(ckpt_path, safe_load=True, return_metadata=True)
 
-        from .. import global_state
-        global_state.DISABLE_DYNAMIC = disable_dynamic
+        os.environ["COMFYUI_QUANTOPS_DISABLE_DYNAMIC"] = str(disable_dynamic)
 
         # Build model from state dict
         try:
@@ -218,8 +218,7 @@ class QuantizedUNETLoader:
         # Standard loading - ComfyUI handles it
         sd, metadata = comfy.utils.load_torch_file(unet_path, safe_load=True, return_metadata=True)
 
-        from .. import global_state
-        global_state.DISABLE_DYNAMIC = disable_dynamic
+        os.environ["COMFYUI_QUANTOPS_DISABLE_DYNAMIC"] = str(disable_dynamic)
 
         # Build model from state dict
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata, disable_dynamic=disable_dynamic)
@@ -340,8 +339,7 @@ class QuantizedCLIPLoader:
             except ImportError as e:
                 logging.warning(f"UnifiedQuantOps not available: {e}")
 
-        from .. import global_state
-        global_state.DISABLE_DYNAMIC = disable_dynamic
+        os.environ["COMFYUI_QUANTOPS_DISABLE_DYNAMIC"] = str(disable_dynamic)
 
         # Load text encoder using ComfyUI's API
         clip = comfy.sd.load_text_encoder_state_dicts(
@@ -478,8 +476,7 @@ class QuantizedDualCLIPLoader:
             except ImportError as e:
                 logging.warning(f"UnifiedQuantOps not available: {e}")
 
-        from .. import global_state
-        global_state.DISABLE_DYNAMIC = disable_dynamic
+        os.environ["COMFYUI_QUANTOPS_DISABLE_DYNAMIC"] = str(disable_dynamic)
 
         # Load dual text encoders using ComfyUI's API
         clip = comfy.sd.load_text_encoder_state_dicts(
