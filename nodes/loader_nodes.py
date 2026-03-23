@@ -99,6 +99,9 @@ class QuantizedModelLoader:
         # Standard loading - ComfyUI handles it
         sd, metadata = comfy.utils.load_torch_file(ckpt_path, safe_load=True, return_metadata=True)
 
+        from .. import global_state
+        global_state.DISABLE_DYNAMIC = disable_dynamic
+
         # Build model from state dict
         try:
             out = comfy.sd.load_state_dict_guess_config(
@@ -214,6 +217,9 @@ class QuantizedUNETLoader:
 
         # Standard loading - ComfyUI handles it
         sd, metadata = comfy.utils.load_torch_file(unet_path, safe_load=True, return_metadata=True)
+
+        from .. import global_state
+        global_state.DISABLE_DYNAMIC = disable_dynamic
 
         # Build model from state dict
         model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata, disable_dynamic=disable_dynamic)
@@ -333,6 +339,9 @@ class QuantizedCLIPLoader:
                 logging.info(f"QuantizedCLIPLoader: Using UnifiedQuantOps for {quant_format}")
             except ImportError as e:
                 logging.warning(f"UnifiedQuantOps not available: {e}")
+
+        from .. import global_state
+        global_state.DISABLE_DYNAMIC = disable_dynamic
 
         # Load text encoder using ComfyUI's API
         clip = comfy.sd.load_text_encoder_state_dicts(
@@ -468,6 +477,9 @@ class QuantizedDualCLIPLoader:
                 logging.info(f"QuantizedDualCLIPLoader: Using UnifiedQuantOps for {quant_format}")
             except ImportError as e:
                 logging.warning(f"UnifiedQuantOps not available: {e}")
+
+        from .. import global_state
+        global_state.DISABLE_DYNAMIC = disable_dynamic
 
         # Load dual text encoders using ComfyUI's API
         clip = comfy.sd.load_text_encoder_state_dicts(
