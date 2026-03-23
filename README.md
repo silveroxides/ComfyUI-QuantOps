@@ -52,10 +52,6 @@ When launching Comfyui add launch argument:
 ```
 --enable-triton-backend
 ```
-Optional but might not be needed for much longer:
-```
---disable-dynamic-vram
-```
 
 
 You can get most of the models here: https://huggingface.co/silveroxides
