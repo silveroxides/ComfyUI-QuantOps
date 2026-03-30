@@ -33,12 +33,12 @@ def is_ck_triton_available() -> bool:
 def _setup_comfy_kitchen_backends():
     """
     Configure comfy-kitchen backends for QuantOps.
-    
+
     1. Re-enable triton backend (ComfyUI disables it by default)
     2. Register QuantOps kernels as a custom backend
     """
     global _CK_AVAILABLE, _CK_TRITON_AVAILABLE
-    
+
     try:
         import comfy_kitchen as ck
         _CK_AVAILABLE = True
@@ -47,14 +47,14 @@ def _setup_comfy_kitchen_backends():
         _CK_AVAILABLE = False
         _CK_TRITON_AVAILABLE = False
         return
-    
+
     # Step 1: Re-enable triton backend (ComfyUI disables it)
     try:
         ck.enable_backend("triton")
-        
+
         backends = ck.list_backends()
         triton_info = backends.get("triton", {})
-        
+
         if triton_info.get("available") and not triton_info.get("disabled"):
             _CK_TRITON_AVAILABLE = True
             logging.info("ComfyUI-QuantOps: Enabled comfy-kitchen triton backend")
@@ -62,11 +62,11 @@ def _setup_comfy_kitchen_backends():
             unavail_reason = triton_info.get("unavailable_reason", "unknown")
             logging.info(f"ComfyUI-QuantOps: comfy-kitchen triton unavailable: {unavail_reason}")
             _CK_TRITON_AVAILABLE = False
-            
+
     except Exception as e:
         logging.warning(f"ComfyUI-QuantOps: Failed to enable ck triton backend: {e}")
         _CK_TRITON_AVAILABLE = False
-    
+
     # Step 2: Register QuantOps kernels as a custom backend
     _register_quantops_backend()
 
@@ -74,7 +74,7 @@ def _setup_comfy_kitchen_backends():
 def _register_quantops_backend():
     """
     Register QuantOps Triton kernels with comfy-kitchen registry.
-    
+
     This allows ck dispatch to use our INT8/FP8 kernels.
     """
     try:
@@ -86,14 +86,14 @@ def _register_quantops_backend():
             ExactDims,
             DivisibleBy,
         )
-        
+
         # Import our kernel modules
         from .kernels import int8_kernels
         from .kernels import fp8_kernels
-        
+
         cuda_devices = frozenset({"cuda"})
         standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
-        
+
         # Build constraints for INT8 kernels
         int8_constraints = {
             "act_quant": FunctionConstraints(
@@ -129,7 +129,7 @@ def _register_quantops_backend():
                 default_devices=cuda_devices,
             ),
         }
-        
+
         # Build constraints for FP8 kernels
         fp8_constraints = {
             "fp8_act_quant": FunctionConstraints(
@@ -157,7 +157,7 @@ def _register_quantops_backend():
                 default_devices=cuda_devices,
             ),
         }
-        
+
         # Register INT8 backend
         try:
             registry.register(
@@ -168,7 +168,7 @@ def _register_quantops_backend():
             logging.info("ComfyUI-QuantOps: Registered quantops_int8 backend")
         except Exception as e:
             logging.debug(f"ComfyUI-QuantOps: Could not register INT8 backend: {e}")
-        
+
         # Register FP8 backend
         try:
             registry.register(
@@ -179,7 +179,7 @@ def _register_quantops_backend():
             logging.info("ComfyUI-QuantOps: Registered quantops_fp8 backend")
         except Exception as e:
             logging.debug(f"ComfyUI-QuantOps: Could not register FP8 backend: {e}")
-            
+
     except ImportError as e:
         logging.debug(f"ComfyUI-QuantOps: Could not register backends (missing deps): {e}")
     except Exception as e:
@@ -316,11 +316,10 @@ _setup_comfy_kitchen_backends()
 # Register layouts
 _register_layouts()
 
-# Import nodes for ComfyUI discovery
-from .nodes.loader_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+# V3 extension entrypoint for ComfyUI discovery
+from .nodes.loader_nodes import comfy_entrypoint
 
 __all__ = [
-    "NODE_CLASS_MAPPINGS",
-    "NODE_DISPLAY_NAME_MAPPINGS",
+    "comfy_entrypoint",
     "is_ck_triton_available",
 ]

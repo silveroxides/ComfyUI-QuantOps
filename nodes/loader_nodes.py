@@ -18,6 +18,29 @@ import comfy.supported_models_base
 import comfy.latent_formats
 import comfy.conds
 
+from comfy_api.latest import ComfyExtension, io
+from typing_extensions import override
+
+# Shared constants for quantized loader nodes
+QUANT_FORMAT_OPTIONS = [
+    "auto", "int8", "int8_tensorwise",
+    "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise",
+    "mxfp8", "hybrid_mxfp8", "nvfp4",
+]
+KERNEL_BACKEND_OPTIONS = ["pytorch", "triton"]
+
+CLIP_TYPE_OPTIONS = [
+    "stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi",
+    "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma",
+    "ace", "omnigen2", "qwen_image", "hunyuan_image", "flux",
+    "hunyuan_video", "flux2", "ovis",
+]
+DUAL_CLIP_TYPE_OPTIONS = [
+    "sdxl", "sd3", "flux", "hunyuan_video", "hidream",
+    "hunyuan_image", "hunyuan_video_15", "kandinsky5",
+    "kandinsky5_image", "ltxv", "newbie", "ace",
+]
+
 # Try to import UnifiedSafetensorsLoader for aimdo-free loading
 try:
     from unifiedefficientloader import UnifiedSafetensorsLoader
@@ -48,470 +71,373 @@ def _load_safetensors(filepath, low_memory=True):
         return comfy.utils.load_torch_file(filepath, safe_load=True, return_metadata=True)
 
 
-class QuantizedModelLoader:
-    """
-    Load models with custom quantization layouts and kernel backend selection.
-
-    Supports models quantized by convert_to_quant (with or without --comfy_quant flag).
-    Automatically handles legacy scale_weight -> weight_scale conversion.
-
-    FP8 Modes:
-    - float8_e4m3fn: Standard tensor-scaled FP8 (uses ComfyUI built-in handling)
-    - float8_e4m3fn_blockwise: Block-wise scaled FP8 (uses HybridFP8Ops)
-    - float8_e4m3fn_rowwise: Row-wise scaled FP8 (uses HybridFP8Ops)
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
-                "quant_format": (["auto", "int8", "int8_tensorwise", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4"],),
-                "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
-    FUNCTION = "load_checkpoint"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load checkpoints with custom quantization support. int8_tensorwise uses torch._int_mm for fast inference."
-
-
-    def load_checkpoint(
-        self, ckpt_name, quant_format, kernel_backend, disable_dynamic, low_memory
-    ):
-        """Load a checkpoint with the specified quantization format and kernel backend."""
-
-        # Set the kernel backend for INT8 blockwise layout (only affects blockwise)
-        if quant_format == "int8":
-            try:
-                from ..quant_layouts.int8_layout import BlockWiseINT8Layout
-
-                BlockWiseINT8Layout.set_backend(kernel_backend)
-                logging.debug(
-                    f"QuantizedModelLoader: Configured INT8 backend to '{kernel_backend}'"
-                )
-            except Exception as e:
-                if kernel_backend == "triton":
-                    logging.warning(f"Failed to configure Triton backend: {e}")
-
-        # Get full checkpoint path
-        ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
-
-        # Select ops class based on quant_format
-        model_options = {}
-        if quant_format != "auto":
-            try:
-                from ..unified_ops import UnifiedQuantOps
-                model_options = {"custom_operations": UnifiedQuantOps}
-                logging.info(
-                    f"QuantizedModelLoader: Using UnifiedQuantOps for {quant_format} models"
-                )
-            except ImportError as e:
-                logging.warning(f"UnifiedQuantOps not available: {e}")
-
-        # Load state dict
-        if quant_format == "auto":
-            # Auto mode: fast header-only detection, then standard loading
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                detected_format = detect_quant_format(ckpt_path)
-                logging.info(f"QuantizedModelLoader: Auto-detected format: {detected_format}")
-
-                # Unconditionally use UnifiedQuantOps so we handle mixed formats perfectly
-                from ..unified_ops import UnifiedQuantOps
-                model_options = {"custom_operations": UnifiedQuantOps}
-            except Exception as e:
-                logging.warning(f"QuantizedModelLoader: Format detection failed: {e}")
-
-        # Load safetensors directly, bypassing aimdo/dynamic VRAM
-        sd, metadata = _load_safetensors(ckpt_path, low_memory=low_memory)
-
-        # Build model from state dict
+def _configure_int8_backend(quant_format: str, kernel_backend: str) -> None:
+    """Configure INT8 kernel backend if applicable (only affects INT8 blockwise)."""
+    if quant_format == "int8":
         try:
-            out = comfy.sd.load_state_dict_guess_config(
-                sd,
-                output_vae=True,
-                output_clip=True,
-                embedding_directory=folder_paths.get_folder_paths("embeddings"),
-                model_options=model_options,
-                disable_dynamic=disable_dynamic,
-                metadata=metadata,
-            )
+            from ..quant_layouts.int8_layout import BlockWiseINT8Layout
+            BlockWiseINT8Layout.set_backend(kernel_backend)
+            logging.debug(f"Configured INT8 backend to '{kernel_backend}'")
         except Exception as e:
-            logging.warning(f"QuantizedModelLoader: state_dict load failed, falling back to path-based loading: {e}")
-            out = comfy.sd.load_checkpoint_guess_config(
-                ckpt_path,
-                output_vae=True,
-                output_clip=True,
-                embedding_directory=folder_paths.get_folder_paths("embeddings"),
-                model_options=model_options,
-                disable_dynamic=disable_dynamic,
-            )
-
-        model = out[0]
-        clip = out[1]
-        vae = out[2]
-
-        # Set cached patcher init for dynamic reloading (mirrors load_checkpoint_guess_config)
-        embedding_directory = folder_paths.get_folder_paths("embeddings")
-        if model is not None:
-            model.cached_patcher_init = (
-                comfy.sd.load_checkpoint_guess_config_model_only,
-                (ckpt_path, embedding_directory, model_options, {}),
-            )
-        if clip is not None:
-            clip.patcher.cached_patcher_init = (
-                comfy.sd.load_checkpoint_guess_config_clip_only,
-                (ckpt_path, embedding_directory, model_options, {}),
-            )
-
-        return (model, clip, vae)
+            if kernel_backend == "triton":
+                logging.warning(f"Failed to configure Triton backend: {e}")
 
 
-class QuantizedUNETLoader:
+def _build_model_options(quant_format: str, model_path: str, base_options: dict = None) -> dict:
+    """Build model_options dict with auto-detection and UnifiedQuantOps setup.
+
+    For all quant formats (including 'auto'), sets up UnifiedQuantOps as custom_operations.
+    When format is 'auto', also performs header-only format detection for logging.
+
+    Args:
+        quant_format: The quantization format string.
+        model_path: Full path to the model file (used for auto-detection).
+        base_options: Optional dict of pre-existing model options to merge with.
+
+    Returns:
+        dict with model_options including custom_operations if applicable.
     """
-    Load UNET/diffusion models with custom quantization layouts.
+    model_options = dict(base_options) if base_options else {}
 
-    Handles legacy scale_weight format automatically.
+    if quant_format == "auto":
+        try:
+            from ..utils.safetensors_loader import detect_quant_format
+            detected_format = detect_quant_format(model_path)
+            logging.info(f"Auto-detected quant format: {detected_format}")
+        except Exception as e:
+            logging.warning(f"Quant format detection failed: {e}")
 
-    FP8 Modes:
-    - float8_e4m3fn: Standard tensor-scaled FP8 (uses ComfyUI built-in handling)
-    - float8_e4m3fn_blockwise: Block-wise scaled FP8 (uses HybridFP8Ops)
-    - float8_e4m3fn_rowwise: Row-wise scaled FP8 (uses HybridFP8Ops)
-    """
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "quant_format": (["auto", "int8", "int8_tensorwise", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4"],),
-                "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "load_unet"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load diffusion models with custom quantization support. int8_tensorwise uses torch._int_mm for fast inference."
-
-    def load_unet(self, unet_name, quant_format, kernel_backend, disable_dynamic, low_memory):
-        """Load a UNET model with the specified settings."""
-
-        # Set kernel backend (only for INT8 blockwise format)
-        if quant_format == "int8":
-            try:
-                from ..quant_layouts.int8_layout import BlockWiseINT8Layout
-
-                BlockWiseINT8Layout.set_backend(kernel_backend)
-                logging.debug(
-                    f"QuantizedUNETLoader: Configured INT8 backend to '{kernel_backend}'"
-                )
-            except Exception as e:
-                if kernel_backend == "triton":
-                    logging.warning(f"Failed to configure Triton backend: {e}")
-
-        # Get model path
-        unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
-
-        # Select ops class based on quant_format
-        model_options = {}
+    # Use UnifiedQuantOps for all formats (handles mixed quantization)
+    try:
+        from ..unified_ops import UnifiedQuantOps
+        model_options["custom_operations"] = UnifiedQuantOps
         if quant_format != "auto":
-            try:
-                from ..unified_ops import UnifiedQuantOps
-                model_options = {"custom_operations": UnifiedQuantOps}
-                logging.info(f"QuantizedUNETLoader: Using UnifiedQuantOps for {quant_format} models")
-            except ImportError as e:
-                logging.warning(f"UnifiedQuantOps not available: {e}")
+            logging.info(f"Using UnifiedQuantOps for {quant_format} models")
+    except ImportError as e:
+        logging.warning(f"UnifiedQuantOps not available: {e}")
 
-        # Load state dict
-        if quant_format == "auto":
-            # Auto mode: fast header-only detection, then standard loading
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                detected_format = detect_quant_format(unet_path)
-                logging.info(f"QuantizedUNETLoader: Auto-detected format: {detected_format}")
-
-                # Unconditionally use UnifiedQuantOps so we handle mixed formats perfectly
-                from ..unified_ops import UnifiedQuantOps
-                model_options = {"custom_operations": UnifiedQuantOps}
-            except Exception as e:
-                logging.warning(f"QuantizedUNETLoader: Format detection failed: {e}")
-
-        # Load safetensors directly, bypassing aimdo/dynamic VRAM
-        sd, metadata = _load_safetensors(unet_path, low_memory=low_memory)
-
-        # Build model from state dict
-        model = comfy.sd.load_diffusion_model_state_dict(sd, model_options=model_options, metadata=metadata, disable_dynamic=disable_dynamic)
-
-        return (model,)
+    return model_options
 
 
-class QuantizedCLIPLoader:
+def _detect_bnb_model_type(state_dict_keys):
+    """Detect BNB model type from state dict keys.
+
+    Detection logic:
+    - Flux2: has double_stream_modulation_img.lin.weight
+    - Chroma: has distilled_guidance_layer but NOT nerf and NOT __x0__
+    - Chroma Radiance: has distilled_guidance_layer AND nerf but NOT __x0__
+    - Chroma Radiance X0: has distilled_guidance_layer AND nerf AND __x0__
+    - Flux: default
     """
-    Load CLIP/text encoders with custom quantization layouts.
+    def has_key_pattern(pattern):
+        return any(pattern in k for k in state_dict_keys)
 
-    Supports text encoders quantized by convert_to_quant with various formats.
+    if has_key_pattern("double_stream_modulation_img.lin.weight"):
+        return "flux2"
 
-    FP8 Modes:
-    - float8_e4m3fn: Standard tensor-scaled FP8 (uses ComfyUI built-in handling)
-    - float8_e4m3fn_blockwise: Block-wise scaled FP8 (uses HybridFP8Ops)
-    - float8_e4m3fn_rowwise: Row-wise scaled FP8 (uses HybridFP8Ops)
+    has_distilled = has_key_pattern("distilled_guidance_layer.")
+    has_nerf = has_key_pattern("nerf_blocks.")
+    has_x0 = has_key_pattern("__x0__")
+
+    if has_distilled:
+        if has_nerf:
+            return "chroma_radiance_x0" if has_x0 else "chroma_radiance"
+        return "chroma"
+
+    return "flux"
+
+
+def _load_unet(unet_name, quant_format, kernel_backend, disable_dynamic, low_memory):
+    """Core UNET/diffusion model loading logic.
+
+    Handles INT8 backend config, format detection, safetensors loading, and model construction.
+    Used by both QuantizedUNETLoader and QuantizedUNETLoaderSimple.
+
+    Returns:
+        The loaded model object.
     """
+    _configure_int8_backend(quant_format, kernel_backend)
 
-    # CLIPType options matching built-in CLIPLoader from nodes.py
-    CLIP_TYPES = [
-        "stable_diffusion",
-        "stable_cascade",
-        "sd3",
-        "stable_audio",
-        "mochi",
-        "ltxv",
-        "pixart",
-        "cosmos",
-        "lumina2",
-        "wan",
-        "hidream",
-        "chroma",
-        "ace",
-        "omnigen2",
-        "qwen_image",
-        "hunyuan_image",
-        "flux",
-        "hunyuan_video",
-        "flux2",
-        "ovis",
-    ]
+    unet_path = folder_paths.get_full_path("diffusion_models", unet_name)
+    model_options = _build_model_options(quant_format, unet_path)
 
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip_name": (folder_paths.get_filename_list("text_encoders"),),
-                "type": (cls.CLIP_TYPES,),
-                "quant_format": (["auto", "int8", "int8_tensorwise", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4"],),
-                "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
+    sd, metadata = _load_safetensors(unet_path, low_memory=low_memory)
 
-    RETURN_TYPES = ("CLIP",)
-    FUNCTION = "load_clip"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load quantized text encoders (CLIP, T5, etc.). int8_tensorwise uses torch._int_mm for fast inference."
+    model = comfy.sd.load_diffusion_model_state_dict(
+        sd, model_options=model_options, metadata=metadata, disable_dynamic=disable_dynamic
+    )
+    return model
 
-    def load_clip(self, clip_name, type, quant_format, kernel_backend, disable_dynamic, low_memory):
-        """Load a CLIP/text encoder with quantization support."""
-        import comfy.model_management
 
-        # Configure INT8 kernel backend (only affects INT8 blockwise models)
-        if quant_format == "int8":
-            try:
-                from ..quant_layouts.int8_layout import BlockWiseINT8Layout
+def _load_checkpoint(ckpt_name, quant_format, kernel_backend, disable_dynamic, low_memory):
+    """Core checkpoint loading logic.
 
-                BlockWiseINT8Layout.set_backend(kernel_backend)
-                logging.debug(
-                    f"QuantizedCLIPLoader: Configured INT8 backend to '{kernel_backend}'"
-                )
-            except Exception as e:
-                if kernel_backend == "triton":
-                    logging.warning(f"Failed to configure Triton backend: {e}")
+    Handles INT8 backend config, format detection, safetensors loading, and model construction.
+    Used by both QuantizedModelLoader and QuantizedModelLoaderSimple.
 
-        # Get clip path
-        clip_path = folder_paths.get_full_path("text_encoders", clip_name)
+    Returns:
+        Tuple of (model, clip, vae).
+    """
+    _configure_int8_backend(quant_format, kernel_backend)
 
-        # Convert type string to CLIPType enum
-        clip_type = getattr(
-            comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION
-        )
+    ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
+    model_options = _build_model_options(quant_format, ckpt_path)
 
-        # Set up model options
-        model_options = {
-            "initial_device": comfy.model_management.text_encoder_offload_device()
-        }
+    sd, metadata = _load_safetensors(ckpt_path, low_memory=low_memory)
 
-        # Load state dict based on format
-        if quant_format == "auto":
-            # Auto mode: fast header-only detection, then standard loading
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                detected_format = detect_quant_format(clip_path)
-                logging.info(f"QuantizedCLIPLoader: Auto-detected format: {detected_format}")
-
-                # Select ops based on detected format
-                if detected_format == "int8_tensorwise":
-                    pass # Handled natively by ComfyUI
-                else:
-                    from ..unified_ops import UnifiedQuantOps
-                    model_options["custom_operations"] = UnifiedQuantOps
-            except Exception as e:
-                logging.warning(f"QuantizedCLIPLoader: Format detection failed: {e}")
-
-            # Load safetensors directly, bypassing aimdo/dynamic VRAM
-            sd, metadata = _load_safetensors(clip_path, low_memory=low_memory)
-        else:
-            # Explicit format: load safetensors directly, bypassing aimdo/dynamic VRAM
-            sd, metadata = _load_safetensors(clip_path, low_memory=low_memory)
-
-            try:
-                from ..unified_ops import UnifiedQuantOps
-                model_options["custom_operations"] = UnifiedQuantOps
-                logging.info(f"QuantizedCLIPLoader: Using UnifiedQuantOps for {quant_format}")
-            except ImportError as e:
-                logging.warning(f"UnifiedQuantOps not available: {e}")
-
-        # Load text encoder using ComfyUI's API
-        clip = comfy.sd.load_text_encoder_state_dicts(
-            state_dicts=[sd],
-            clip_type=clip_type,
-            model_options=model_options,
+    # Build model from state dict
+    try:
+        out = comfy.sd.load_state_dict_guess_config(
+            sd,
+            output_vae=True,
+            output_clip=True,
             embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            model_options=model_options,
+            disable_dynamic=disable_dynamic,
+            metadata=metadata,
+        )
+    except Exception as e:
+        logging.warning(f"State dict load failed, falling back to path-based loading: {e}")
+        out = comfy.sd.load_checkpoint_guess_config(
+            ckpt_path,
+            output_vae=True,
+            output_clip=True,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            model_options=model_options,
             disable_dynamic=disable_dynamic,
         )
 
-        return (clip,)
+    model = out[0]
+    clip = out[1]
+    vae = out[2]
+
+    # Set cached patcher init for dynamic reloading
+    embedding_directory = folder_paths.get_folder_paths("embeddings")
+    if model is not None:
+        model.cached_patcher_init = (
+            comfy.sd.load_checkpoint_guess_config_model_only,
+            (ckpt_path, embedding_directory, model_options, {}),
+        )
+    if clip is not None:
+        clip.patcher.cached_patcher_init = (
+            comfy.sd.load_checkpoint_guess_config_clip_only,
+            (ckpt_path, embedding_directory, model_options, {}),
+        )
+
+    return (model, clip, vae)
 
 
-class QuantizedDualCLIPLoader:
+def _load_clip(clip_name, clip_type_str, quant_format, kernel_backend, disable_dynamic, low_memory):
+    """Core CLIP/text encoder loading logic.
+
+    Used by both QuantizedCLIPLoader and QuantizedCLIPLoaderSimple.
+
+    Args:
+        clip_name: Filename of the text encoder.
+        clip_type_str: String name of clip type (e.g. 'flux', 'sd3').
+        quant_format: Quantization format string.
+        kernel_backend: Backend string ('pytorch' or 'triton').
+        disable_dynamic: Whether to disable dynamic VRAM.
+        low_memory: Whether to use low-memory loading.
+
+    Returns:
+        The loaded CLIP object.
     """
-    Load two text encoders with custom quantization layouts (e.g. CLIP-L + T5).
+    import comfy.model_management
 
-    Either or both encoders may be quantized. The Hybrid ops classes handle
-    mixed quantized/unquantized weights transparently.
+    _configure_int8_backend(quant_format, kernel_backend)
 
-    text_encoder2 lists files from both text_encoders and checkpoints folders.
-    When type is 'ltxv', text_encoder2 resolves from checkpoints; otherwise from text_encoders.
+    clip_path = folder_paths.get_full_path("text_encoders", clip_name)
+
+    # Convert type string to CLIPType enum
+    clip_type = getattr(comfy.sd.CLIPType, clip_type_str.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+
+    # Build model options with initial_device for text encoders
+    base_options = {"initial_device": comfy.model_management.text_encoder_offload_device()}
+    model_options = _build_model_options(quant_format, clip_path, base_options=base_options)
+
+    sd, metadata = _load_safetensors(clip_path, low_memory=low_memory)
+
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        state_dicts=[sd],
+        clip_type=clip_type,
+        model_options=model_options,
+        embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        disable_dynamic=disable_dynamic,
+    )
+    return clip
+
+
+def _load_dual_clip(text_encoder1, text_encoder2, clip_type_str, quant_format, kernel_backend, disable_dynamic, low_memory):
+    """Core dual CLIP/text encoder loading logic.
+
+    Used by both QuantizedDualCLIPLoader and QuantizedDualCLIPLoaderSimple.
+
+    Args:
+        text_encoder1: Filename of first text encoder.
+        text_encoder2: Filename of second text encoder.
+        clip_type_str: String name of clip type.
+        quant_format: Quantization format string.
+        kernel_backend: Backend string.
+        disable_dynamic: Whether to disable dynamic VRAM.
+        low_memory: Whether to use low-memory loading.
+
+    Returns:
+        The loaded CLIP object.
     """
+    import comfy.model_management
 
-    CLIP_TYPES = [
-        "sdxl",
-        "sd3",
-        "flux",
-        "hunyuan_video",
-        "hidream",
-        "hunyuan_image",
-        "hunyuan_video_15",
-        "kandinsky5",
-        "kandinsky5_image",
-        "ltxv",
-        "newbie",
-        "ace",
-    ]
+    _configure_int8_backend(quant_format, kernel_backend)
+
+    clip_path1 = folder_paths.get_full_path("text_encoders", text_encoder1)
+
+    # For ltxv, text_encoder2 resolves from checkpoints; otherwise from text_encoders
+    if clip_type_str == "ltxv":
+        clip_path2 = folder_paths.get_full_path("checkpoints", text_encoder2)
+    else:
+        clip_path2 = folder_paths.get_full_path("text_encoders", text_encoder2)
+
+    clip_type = getattr(comfy.sd.CLIPType, clip_type_str.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+
+    base_options = {"initial_device": comfy.model_management.text_encoder_offload_device()}
+    model_options = _build_model_options(quant_format, clip_path1, base_options=base_options)
+
+    sd1, metadata1 = _load_safetensors(clip_path1, low_memory=low_memory)
+    sd2, metadata2 = _load_safetensors(clip_path2, low_memory=low_memory)
+
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        state_dicts=[sd1, sd2],
+        clip_type=clip_type,
+        model_options=model_options,
+        embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        disable_dynamic=disable_dynamic,
+    )
+    return clip
+
+
+class QuantizedModelLoader(io.ComfyNode):
+    """Load models with custom quantization layouts and kernel backend selection."""
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="QuantizedModelLoader",
+            display_name="Load Checkpoint (Quantized)",
+            category="loaders/quantized",
+            description="Load checkpoints with custom quantization support. int8_tensorwise uses torch._int_mm for fast inference.",
+            inputs=[
+                io.Combo.Input("ckpt_name", options=folder_paths.get_filename_list("checkpoints")),
+                io.Combo.Input("quant_format", options=QUANT_FORMAT_OPTIONS, default="auto"),
+                io.Combo.Input("kernel_backend", options=KERNEL_BACKEND_OPTIONS, default="pytorch"),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+                io.Clip.Output(display_name="clip"),
+                io.Vae.Output(display_name="vae"),
+            ],
+        )
 
     @classmethod
-    def INPUT_TYPES(cls):
+    def execute(cls, ckpt_name, quant_format, kernel_backend, disable_dynamic, low_memory) -> io.NodeOutput:
+        model, clip, vae = _load_checkpoint(ckpt_name, quant_format, kernel_backend, disable_dynamic, low_memory)
+        return io.NodeOutput(model, clip, vae)
+
+
+class QuantizedUNETLoader(io.ComfyNode):
+    """Load UNET/diffusion models with custom quantization layouts."""
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="QuantizedUNETLoader",
+            display_name="Load Diffusion Model (Quantized)",
+            category="loaders/quantized",
+            description="Load diffusion models with custom quantization support. int8_tensorwise uses torch._int_mm for fast inference.",
+            inputs=[
+                io.Combo.Input("unet_name", options=folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("quant_format", options=QUANT_FORMAT_OPTIONS, default="auto"),
+                io.Combo.Input("kernel_backend", options=KERNEL_BACKEND_OPTIONS, default="pytorch"),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, unet_name, quant_format, kernel_backend, disable_dynamic, low_memory) -> io.NodeOutput:
+        model = _load_unet(unet_name, quant_format, kernel_backend, disable_dynamic, low_memory)
+        return io.NodeOutput(model)
+
+
+class QuantizedCLIPLoader(io.ComfyNode):
+    """Load CLIP/text encoders with custom quantization layouts."""
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="QuantizedCLIPLoader",
+            display_name="Load CLIP (Quantized)",
+            category="loaders/quantized",
+            description="Load quantized text encoders (CLIP, T5, etc.). int8_tensorwise uses torch._int_mm for fast inference.",
+            inputs=[
+                io.Combo.Input("clip_name", options=folder_paths.get_filename_list("text_encoders")),
+                io.Combo.Input("type", options=CLIP_TYPE_OPTIONS),
+                io.Combo.Input("quant_format", options=QUANT_FORMAT_OPTIONS, default="auto"),
+                io.Combo.Input("kernel_backend", options=KERNEL_BACKEND_OPTIONS, default="pytorch"),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Clip.Output(display_name="clip"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, clip_name, type, quant_format, kernel_backend, disable_dynamic, low_memory) -> io.NodeOutput:
+        clip = _load_clip(clip_name, type, quant_format, kernel_backend, disable_dynamic, low_memory)
+        return io.NodeOutput(clip)
+
+
+class QuantizedDualCLIPLoader(io.ComfyNode):
+    """Load two text encoders with custom quantization layouts (e.g. CLIP-L + T5)."""
+    @classmethod
+    def define_schema(cls):
         te_list = folder_paths.get_filename_list("text_encoders")
         te_and_ckpt_list = list(te_list) + list(folder_paths.get_filename_list("checkpoints"))
-        return {
-            "required": {
-                "text_encoder1": (te_list,),
-                "text_encoder2": (te_and_ckpt_list,),
-                "type": (cls.CLIP_TYPES,),
-                "quant_format": (["auto", "int8", "int8_tensorwise", "float8_e4m3fn", "float8_e4m3fn_blockwise", "float8_e4m3fn_rowwise", "mxfp8", "hybrid_mxfp8", "nvfp4"],),
-                "kernel_backend": (["pytorch", "triton"],),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
-
-    RETURN_TYPES = ("CLIP",)
-    FUNCTION = "load_clip"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = (
-        "Load two quantized text encoders (e.g. CLIP-L + T5). "
-        "int8_tensorwise uses torch._int_mm for fast inference.\n\n"
-        "[Recipes]\n"
-        "sdxl: clip-l, clip-g\n"
-        "sd3: clip-l, clip-g / clip-l, t5 / clip-g, t5\n"
-        "flux: clip-l, t5\n"
-        "hidream: at least one of t5 or llama, recommended t5 and llama\n"
-        "hunyuan_image: qwen2.5vl 7b and byt5 small\n"
-        "newbie: gemma-3-4b-it, jina clip v2"
-    )
-
-    def load_clip(self, text_encoder1, text_encoder2, type, quant_format, kernel_backend, disable_dynamic, low_memory):
-        """Load two text encoders with quantization support."""
-        import comfy.model_management
-
-        # Configure INT8 kernel backend (only affects INT8 blockwise models)
-        if quant_format == "int8":
-            try:
-                from ..quant_layouts.int8_layout import BlockWiseINT8Layout
-
-                BlockWiseINT8Layout.set_backend(kernel_backend)
-                logging.debug(
-                    f"QuantizedDualCLIPLoader: Configured INT8 backend to '{kernel_backend}'"
-                )
-            except Exception as e:
-                if kernel_backend == "triton":
-                    logging.warning(f"Failed to configure Triton backend: {e}")
-
-        # Resolve paths
-        clip_path1 = folder_paths.get_full_path("text_encoders", text_encoder1)
-
-        # For ltxv, text_encoder2 resolves from checkpoints; otherwise from text_encoders
-        if type == "ltxv":
-            clip_path2 = folder_paths.get_full_path("checkpoints", text_encoder2)
-        else:
-            clip_path2 = folder_paths.get_full_path("text_encoders", text_encoder2)
-
-        # Convert type string to CLIPType enum
-        clip_type = getattr(
-            comfy.sd.CLIPType, type.upper(), comfy.sd.CLIPType.STABLE_DIFFUSION
+        return io.Schema(
+            node_id="QuantizedDualCLIPLoader",
+            display_name="Load DualCLIP (Quantized)",
+            category="loaders/quantized",
+            description=(
+                "Load two quantized text encoders (e.g. CLIP-L + T5). "
+                "int8_tensorwise uses torch._int_mm for fast inference.\n\n"
+                "[Recipes]\n"
+                "sdxl: clip-l, clip-g\n"
+                "sd3: clip-l, clip-g / clip-l, t5 / clip-g, t5\n"
+                "flux: clip-l, t5\n"
+                "hidream: at least one of t5 or llama, recommended t5 and llama\n"
+                "hunyuan_image: qwen2.5vl 7b and byt5 small\n"
+                "newbie: gemma-3-4b-it, jina clip v2"
+            ),
+            inputs=[
+                io.Combo.Input("text_encoder1", options=te_list),
+                io.Combo.Input("text_encoder2", options=te_and_ckpt_list),
+                io.Combo.Input("type", options=DUAL_CLIP_TYPE_OPTIONS),
+                io.Combo.Input("quant_format", options=QUANT_FORMAT_OPTIONS, default="auto"),
+                io.Combo.Input("kernel_backend", options=KERNEL_BACKEND_OPTIONS, default="pytorch"),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Clip.Output(display_name="clip"),
+            ],
         )
 
-        # Set up model options
-        model_options = {
-            "initial_device": comfy.model_management.text_encoder_offload_device()
-        }
-
-        # Load both state dicts directly, bypassing aimdo/dynamic VRAM
-        sd1, metadata1 = _load_safetensors(clip_path1, low_memory=low_memory)
-        sd2, metadata2 = _load_safetensors(clip_path2, low_memory=low_memory)
-
-        # Set ops based on quant_format
-        if quant_format == "auto":
-            try:
-                from ..utils.safetensors_loader import detect_quant_format
-                # Detect from first encoder (primary); second may differ
-                detected_format = detect_quant_format(clip_path1)
-                logging.info(f"QuantizedDualCLIPLoader: Auto-detected format (encoder1): {detected_format}")
-
-                from ..unified_ops import UnifiedQuantOps
-                model_options["custom_operations"] = UnifiedQuantOps
-
-                # Also check second encoder if first didn't set ops
-                if "custom_operations" not in model_options:
-                    detected_format2 = detect_quant_format(clip_path2)
-                    logging.info(f"QuantizedDualCLIPLoader: Auto-detected format (encoder2): {detected_format2}")
-                    from ..unified_ops import UnifiedQuantOps
-                    model_options["custom_operations"] = UnifiedQuantOps
-            except Exception as e:
-                logging.warning(f"QuantizedDualCLIPLoader: Format detection failed: {e}")
-        else:
-            try:
-                from ..unified_ops import UnifiedQuantOps
-                model_options["custom_operations"] = UnifiedQuantOps
-                logging.info(f"QuantizedDualCLIPLoader: Using UnifiedQuantOps for {quant_format}")
-            except ImportError as e:
-                logging.warning(f"UnifiedQuantOps not available: {e}")
-
-        # Load dual text encoders using ComfyUI's API
-        clip = comfy.sd.load_text_encoder_state_dicts(
-            state_dicts=[sd1, sd2],
-            clip_type=clip_type,
-            model_options=model_options,
-            embedding_directory=folder_paths.get_folder_paths("embeddings"),
-            disable_dynamic=disable_dynamic,
-        )
-
-        return (clip,)
+    @classmethod
+    def execute(cls, text_encoder1, text_encoder2, type, quant_format, kernel_backend, disable_dynamic, low_memory) -> io.NodeOutput:
+        clip = _load_dual_clip(text_encoder1, text_encoder2, type, quant_format, kernel_backend, disable_dynamic, low_memory)
+        return io.NodeOutput(clip)
 
 
 class BNB4bitFluxConfig(comfy.supported_models_base.BASE):
@@ -547,70 +473,26 @@ class BNB4bitFluxModel(comfy.model_base.BaseModel):
         return out
 
 
-class BNB4bitUNETLoader:
-    """
-    Load UNET/diffusion models quantized to BNB 4-bit (NF4/FP4) format.
-
-    Supports models quantized by convert_to_quant with --bnb-4bit flag.
-    Dequantizes weights during forward pass using pure PyTorch.
-
-    Auto-detects Flux vs Flux2 from state dict keys (not shapes).
-    """
+class BNB4bitUNETLoader(io.ComfyNode):
+    """Load UNET/diffusion models quantized to BNB 4-bit (NF4/FP4) format."""
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="BNB4bitUNETLoader",
+            display_name="Load Diffusion Model (BNB 4-bit)",
+            category="loaders/quantized",
+            description="Load BNB 4-bit (NF4/FP4) quantized Flux/Chroma/Radiance models. Uses pure PyTorch dequantization.",
+            inputs=[
+                io.Combo.Input("unet_name", options=folder_paths.get_filename_list("diffusion_models")),
+                io.Combo.Input("model_type_override", options=["auto", "flux2", "flux", "chroma", "chroma_radiance", "chroma_radiance_x0"], default="auto", optional=True),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+            ],
+        )
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-            },
-            "optional": {
-                "model_type_override": (["auto", "flux2", "flux", "chroma", "chroma_radiance", "chroma_radiance_x0"],),
-            },
-        }
-
-
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "load_unet"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load BNB 4-bit (NF4/FP4) quantized Flux/Chroma/Radiance models. Uses pure PyTorch dequantization."
-
-    def _detect_model_type(self, state_dict_keys):
-        """
-        Detect model type from state dict keys (not shapes).
-
-        Detection logic:
-        - Flux2: has double_stream_modulation_img.lin.weight
-        - Chroma: has distilled_guidance_layer but NOT nerf and NOT __x0__
-        - Chroma Radiance: has distilled_guidance_layer AND nerf but NOT __x0__
-        - Chroma Radiance X0: has distilled_guidance_layer AND nerf AND __x0__
-        - Flux: default (has double_blocks but none of the above)
-        """
-        # Helper to check key presence (handles BNB suffix keys)
-        def has_key_pattern(pattern):
-            return any(pattern in k for k in state_dict_keys)
-
-        # Check for Flux2 unique key
-        if has_key_pattern("double_stream_modulation_img.lin.weight"):
-            return "flux2"
-
-        # Check for Chroma/Radiance variants
-        has_distilled = has_key_pattern("distilled_guidance_layer.")
-        has_nerf = has_key_pattern("nerf_blocks.")
-        has_x0 = has_key_pattern("__x0__")
-
-        if has_distilled:
-            if has_nerf:
-                if has_x0:
-                    return "chroma_radiance_x0"
-                else:
-                    return "chroma_radiance"
-            else:
-                return "chroma"
-
-        # Default to Flux1
-        return "flux"
-
-    def load_unet(self, unet_name, model_type_override="auto"):
+    def execute(cls, unet_name, model_type_override="auto") -> io.NodeOutput:
         """Load a BNB 4-bit quantized UNET model."""
         import comfy.model_management as model_management
         import comfy.ldm.flux.model as flux_model
@@ -636,7 +518,7 @@ class BNB4bitUNETLoader:
 
         # Detect or use override
         if model_type_override == "auto":
-            model_type = self._detect_model_type(sd.keys())
+            model_type = _detect_bnb_model_type(sd.keys())
             logging.info(f"BNB4bitUNETLoader: Auto-detected model type: {model_type}")
         else:
             model_type = model_type_override
@@ -812,118 +694,136 @@ class BNB4bitUNETLoader:
         logging.info(f"BNB4bitUNETLoader: Successfully loaded {unet_name}")
 
         patcher = comfy.model_patcher.ModelPatcher(model, load_device=load_device, offload_device=offload_device)
-        return (patcher,)
+        return io.NodeOutput(patcher)
 
 
-class QuantizedModelLoaderSimple:
+class QuantizedModelLoaderSimple(io.ComfyNode):
     """Simple loader for quantized models (no format or backend selection)."""
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "ckpt_name": (folder_paths.get_filename_list("checkpoints"),),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
-    RETURN_TYPES = ("MODEL", "CLIP", "VAE")
-    FUNCTION = "load_checkpoint"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Simple loader for custom quantized models. Automatically detects formats."
+    def define_schema(cls):
+        return io.Schema(
+            node_id="QuantizedModelLoaderSimple",
+            display_name="Load Checkpoint (Quantized, Simple)",
+            category="loaders/quantized",
+            description="Simple loader for custom quantized models. Automatically detects formats.",
+            inputs=[
+                io.Combo.Input("ckpt_name", options=folder_paths.get_filename_list("checkpoints")),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+                io.Clip.Output(display_name="clip"),
+                io.Vae.Output(display_name="vae"),
+            ],
+        )
 
-    def load_checkpoint(self, ckpt_name, disable_dynamic, low_memory):
-        return QuantizedModelLoader().load_checkpoint(ckpt_name, "auto", "pytorch", disable_dynamic, low_memory)
+    @classmethod
+    def execute(cls, ckpt_name, disable_dynamic, low_memory) -> io.NodeOutput:
+        model, clip, vae = _load_checkpoint(ckpt_name, "auto", "pytorch", disable_dynamic, low_memory)
+        return io.NodeOutput(model, clip, vae)
 
 
-class QuantizedUNETLoaderSimple:
+class QuantizedUNETLoaderSimple(io.ComfyNode):
     """Simple loader for quantized UNET models (no format or backend selection)."""
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "unet_name": (folder_paths.get_filename_list("diffusion_models"),),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
-    RETURN_TYPES = ("MODEL",)
-    FUNCTION = "load_unet"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Simple loader for custom quantized diffusion models. Automatically detects formats."
+    def define_schema(cls):
+        return io.Schema(
+            node_id="QuantizedUNETLoaderSimple",
+            display_name="Load Diffusion Model (Quantized, Simple)",
+            category="loaders/quantized",
+            description="Simple loader for custom quantized diffusion models. Automatically detects formats.",
+            inputs=[
+                io.Combo.Input("unet_name", options=folder_paths.get_filename_list("diffusion_models")),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Model.Output(display_name="model"),
+            ],
+        )
 
-    def load_unet(self, unet_name, disable_dynamic, low_memory):
-        return QuantizedUNETLoader().load_unet(unet_name, "auto", "pytorch", disable_dynamic, low_memory)
+    @classmethod
+    def execute(cls, unet_name, disable_dynamic, low_memory) -> io.NodeOutput:
+        model = _load_unet(unet_name, "auto", "pytorch", disable_dynamic, low_memory)
+        return io.NodeOutput(model)
 
 
-class QuantizedCLIPLoaderSimple:
+class QuantizedCLIPLoaderSimple(io.ComfyNode):
     """Simple loader for quantized CLIP models (no format or backend selection)."""
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "clip_name": (folder_paths.get_filename_list("text_encoders"),),
-                "type": (QuantizedCLIPLoader.CLIP_TYPES,),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
-    RETURN_TYPES = ("CLIP",)
-    FUNCTION = "load_clip"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Simple loader for custom quantized text encoders. Automatically detects formats."
+    def define_schema(cls):
+        return io.Schema(
+            node_id="QuantizedCLIPLoaderSimple",
+            display_name="Load CLIP (Quantized, Simple)",
+            category="loaders/quantized",
+            description="Simple loader for custom quantized text encoders. Automatically detects formats.",
+            inputs=[
+                io.Combo.Input("clip_name", options=folder_paths.get_filename_list("text_encoders")),
+                io.Combo.Input("type", options=CLIP_TYPE_OPTIONS),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Clip.Output(display_name="clip"),
+            ],
+        )
 
-    def load_clip(self, clip_name, type, disable_dynamic, low_memory):
-        return QuantizedCLIPLoader().load_clip(clip_name, type, "auto", "pytorch", disable_dynamic, low_memory)
+    @classmethod
+    def execute(cls, clip_name, type, disable_dynamic, low_memory) -> io.NodeOutput:
+        clip = _load_clip(clip_name, type, "auto", "pytorch", disable_dynamic, low_memory)
+        return io.NodeOutput(clip)
 
 
-class QuantizedDualCLIPLoaderSimple:
+class QuantizedDualCLIPLoaderSimple(io.ComfyNode):
     """Simple loader for dual quantized CLIP models (no format or backend selection)."""
     @classmethod
-    def INPUT_TYPES(cls):
+    def define_schema(cls):
         te_list = folder_paths.get_filename_list("text_encoders")
         te_and_ckpt_list = list(te_list) + list(folder_paths.get_filename_list("checkpoints"))
-        return {
-            "required": {
-                "text_encoder1": (te_list,),
-                "text_encoder2": (te_and_ckpt_list,),
-                "type": (QuantizedDualCLIPLoader.CLIP_TYPES,),
-                "disable_dynamic": ("BOOLEAN", {"default": True}),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-
-            },
-        }
-    RETURN_TYPES = ("CLIP",)
-    FUNCTION = "load_clip"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Simple loader for dual custom quantized text encoders. Automatically detects formats."
-
-    def load_clip(self, text_encoder1, text_encoder2, type, disable_dynamic, low_memory):
-        return QuantizedDualCLIPLoader().load_clip(text_encoder1, text_encoder2, type, "auto", "pytorch", disable_dynamic, low_memory)
-
-
-class EfficientVAELoader:
-    """
-    Load VAE models using direct safetensors loading, bypassing aimdo/dynamic VRAM.
-
-    Uses UnifiedSafetensorsLoader when available to avoid ComfyUI's aimdo mmap layer,
-    then constructs the VAE via comfy.sd.VAE(sd=..., metadata=...).
-    """
+        return io.Schema(
+            node_id="QuantizedDualCLIPLoaderSimple",
+            display_name="Load DualCLIP (Quantized, Simple)",
+            category="loaders/quantized",
+            description="Simple loader for dual custom quantized text encoders. Automatically detects formats.",
+            inputs=[
+                io.Combo.Input("text_encoder1", options=te_list),
+                io.Combo.Input("text_encoder2", options=te_and_ckpt_list),
+                io.Combo.Input("type", options=DUAL_CLIP_TYPE_OPTIONS),
+                io.Boolean.Input("disable_dynamic", default=True),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Clip.Output(display_name="clip"),
+            ],
+        )
 
     @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "vae_name": (folder_paths.get_filename_list("vae"),),
-                "low_memory": ("BOOLEAN", {"default": True, "tooltip": "Use fast and efficient low impact loading of model."}),
-            },
-        }
+    def execute(cls, text_encoder1, text_encoder2, type, disable_dynamic, low_memory) -> io.NodeOutput:
+        clip = _load_dual_clip(text_encoder1, text_encoder2, type, "auto", "pytorch", disable_dynamic, low_memory)
+        return io.NodeOutput(clip)
 
-    RETURN_TYPES = ("VAE",)
-    FUNCTION = "load_vae"
-    CATEGORY = "loaders/quantized"
-    DESCRIPTION = "Load VAE models with direct safetensors loading (bypasses aimdo/dynamic VRAM)."
 
-    def load_vae(self, vae_name, low_memory):
+class EfficientVAELoader(io.ComfyNode):
+    """Load VAE models using direct safetensors loading, bypassing aimdo/dynamic VRAM."""
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="EfficientVAELoader",
+            display_name="Load VAE (No Dynamic VRAM)",
+            category="loaders/quantized",
+            description="Load VAE models with direct safetensors loading (bypasses aimdo/dynamic VRAM).",
+            inputs=[
+                io.Combo.Input("vae_name", options=folder_paths.get_filename_list("vae")),
+                io.Boolean.Input("low_memory", default=True),
+            ],
+            outputs=[
+                io.Vae.Output(display_name="vae"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, vae_name, low_memory) -> io.NodeOutput:
         """Load a VAE model, bypassing aimdo/dynamic VRAM."""
         vae_path = folder_paths.get_full_path("vae", vae_name)
 
@@ -934,34 +834,27 @@ class EfficientVAELoader:
         vae = comfy.sd.VAE(sd=sd, metadata=metadata)
         vae.throw_exception_if_invalid()
 
-        return (vae,)
+        return io.NodeOutput(vae)
 
 
-# ComfyUI node registration
-NODE_CLASS_MAPPINGS = {
-    "QuantizedModelLoader": QuantizedModelLoader,
-    "QuantizedUNETLoader": QuantizedUNETLoader,
-    "QuantizedCLIPLoader": QuantizedCLIPLoader,
-    "QuantizedDualCLIPLoader": QuantizedDualCLIPLoader,
-    "QuantizedModelLoaderSimple": QuantizedModelLoaderSimple,
-    "QuantizedUNETLoaderSimple": QuantizedUNETLoaderSimple,
-    "QuantizedCLIPLoaderSimple": QuantizedCLIPLoaderSimple,
-    "QuantizedDualCLIPLoaderSimple": QuantizedDualCLIPLoaderSimple,
-    "BNB4bitUNETLoader": BNB4bitUNETLoader,
-    "EfficientVAELoader": EfficientVAELoader,
-}
+# V3 ComfyUI extension registration
+class QuantOpsExtension(ComfyExtension):
+    @override
+    async def get_node_list(self) -> list[type[io.ComfyNode]]:
+        return [
+            QuantizedModelLoader,
+            QuantizedUNETLoader,
+            QuantizedCLIPLoader,
+            QuantizedDualCLIPLoader,
+            BNB4bitUNETLoader,
+            QuantizedModelLoaderSimple,
+            QuantizedUNETLoaderSimple,
+            QuantizedCLIPLoaderSimple,
+            QuantizedDualCLIPLoaderSimple,
+            EfficientVAELoader,
+        ]
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "QuantizedModelLoader": "Load Checkpoint (Quantized)",
-    "QuantizedUNETLoader": "Load Diffusion Model (Quantized)",
-    "QuantizedCLIPLoader": "Load CLIP (Quantized)",
-    "QuantizedDualCLIPLoader": "Load DualCLIP (Quantized)",
-    "QuantizedModelLoaderSimple": "Load Checkpoint (Quantized, Simple)",
-    "QuantizedUNETLoaderSimple": "Load Diffusion Model (Quantized, Simple)",
-    "QuantizedCLIPLoaderSimple": "Load CLIP (Quantized, Simple)",
-    "QuantizedDualCLIPLoaderSimple": "Load DualCLIP (Quantized, Simple)",
-    "BNB4bitUNETLoader": "Load Diffusion Model (BNB 4-bit)",
-    "EfficientVAELoader": "Load VAE (No Dynamic VRAM)",
-}
 
+async def comfy_entrypoint() -> QuantOpsExtension:
+    return QuantOpsExtension()
 
