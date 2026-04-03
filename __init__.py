@@ -298,6 +298,64 @@ def _register_layouts():
             },
         )
 
+        # --- QuantHandler registration (PR test) ---
+        try:
+            from comfy.quant_ops import QuantHandler, register_quant_handler
+
+            def build_int8_tensorwise_params(
+                layout_cls, state_dict, prefix, device,
+                manually_loaded_keys, compute_dtype,
+                out_features, in_features, load_scale_fn,
+            ):
+                scale = load_scale_fn(state_dict, prefix, "weight_scale", device, manually_loaded_keys)
+                return layout_cls.Params(
+                    scale=scale,
+                    orig_dtype=compute_dtype,
+                    orig_shape=(out_features, in_features),
+                    is_weight=True,
+                )
+
+            def build_int8_blockwise_params(
+                layout_cls, state_dict, prefix, device,
+                manually_loaded_keys, compute_dtype,
+                out_features, in_features, load_scale_fn,
+            ):
+                scale = load_scale_fn(state_dict, prefix, "weight_scale", device, manually_loaded_keys)
+                return layout_cls.Params(
+                    scale=scale,
+                    orig_dtype=compute_dtype,
+                    orig_shape=(out_features, in_features),
+                    block_size=128,
+                    is_weight=True,
+                )
+
+            # TensorWiseINT8Layout (imported above in its own try block)
+            try:
+                register_quant_handler("int8_tensorwise", QuantHandler(
+                    layout_class=TensorWiseINT8Layout,
+                    storage_t=torch.int8,
+                    parameters={"weight_scale", "input_scale"},
+                    comfy_tensor_layout="TensorWiseINT8Layout",
+                    build_params=build_int8_tensorwise_params,
+                ))
+                logging.info("ComfyUI-QuantOps: Registered int8_tensorwise via QuantHandler")
+            except NameError:
+                logging.debug("ComfyUI-QuantOps: TensorWiseINT8Layout not available for QuantHandler registration")
+
+            # BlockWiseINT8Layout (imported at top of _register_layouts)
+            register_quant_handler("int8_blockwise", QuantHandler(
+                layout_class=BlockWiseINT8Layout,
+                storage_t=torch.int8,
+                parameters={"weight_scale", "input_scale"},
+                comfy_tensor_layout="BlockWiseINT8Layout",
+                group_size=128,
+                build_params=build_int8_blockwise_params,
+            ))
+            logging.info("ComfyUI-QuantOps: Registered int8_blockwise via QuantHandler")
+
+        except ImportError:
+            logging.info("ComfyUI-QuantOps: QuantHandler API not available, using legacy registration only")
+
         # Verify registration
         registered = ["BlockWiseINT8Layout", "TensorWiseINT8Layout", "RowWiseFP8Layout", "BlockWiseFP8Layout", "TensorCoreMXFP8Layout"]
         logging.info(f"ComfyUI-QuantOps: Registered layouts: {registered}")
