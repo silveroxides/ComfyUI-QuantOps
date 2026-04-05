@@ -1,12 +1,11 @@
 """QuantOps utilities."""
-from .safetensors_loader import (
-    MemoryEfficientSafeOpen,
-    load_fp8_state_dict,
-    get_layer_metadata,
-)
+from unifiedefficientloader import UnifiedSafetensorsLoader, tensor_to_dict
+from .safetensors_loader import extract_quantization_metadata, detect_quant_format, _is_scale_tensor
 
 __all__ = [
-    "MemoryEfficientSafeOpen",
-    "load_fp8_state_dict",
-    "get_layer_metadata",
+    "UnifiedSafetensorsLoader",
+    "tensor_to_dict",
+    "extract_quantization_metadata",
+    "detect_quant_format",
+    "_is_scale_tensor",
 ]

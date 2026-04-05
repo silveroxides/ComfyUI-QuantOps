@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import logging
 from comfy.ops import manual_cast, cast_bias_weight, uncast_bias_weight
+from unifiedefficientloader import tensor_to_dict
 
 
 # NF4 (Normal Float 4-bit) quantization table
@@ -66,13 +67,6 @@ FP4_QUANT_MAP = torch.tensor([
     -0.66666667,
     -1.0,
 ], dtype=torch.float32)
-
-
-def tensor_to_dict(tensor_data: torch.Tensor) -> dict:
-    """Convert a uint8 tensor containing JSON bytes back to a dictionary."""
-    byte_data = bytes(tensor_data.cpu().tolist())
-    json_str = byte_data.decode("utf-8")
-    return json.loads(json_str)
 
 
 def get_quant_map(quant_type: str, device: torch.device) -> torch.Tensor:

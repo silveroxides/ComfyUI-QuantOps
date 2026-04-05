@@ -392,7 +392,7 @@ def _int8_gemm_pytorch_fallback(
             a_scale = a_scale.reshape(expected_scale_shape)
 
     a_blocked = a_int8.reshape(*batch_shape, K // block_size, block_size)
-    a_scale_broadcast = a_scale.unsqueeze(-1)
+    a_scale_broadcast = a_scale.to(torch.float32).unsqueeze(-1)
     a_fp32 = a_blocked.to(torch.float32) * a_scale_broadcast
     a_fp32 = a_fp32.reshape(*batch_shape, K)
 
@@ -405,9 +405,17 @@ def _int8_gemm_pytorch_fallback(
 
     b_blocked = b_int8.reshape(N // block_size, block_size, K // block_size, block_size)
     b_blocked = b_blocked.permute(0, 2, 1, 3)
-    b_scale_broadcast = b_scale.unsqueeze(-1).unsqueeze(-1)
+    b_scale_broadcast = b_scale.to(torch.float32).unsqueeze(-1).unsqueeze(-1)
     b_fp32 = b_blocked.to(torch.float32) * b_scale_broadcast
     b_fp32 = b_fp32.permute(0, 2, 1, 3).reshape(N, K)
+
+    # Ensure consistent float32 dtypes to prevent BFloat16/Float mismatches
+    # that can occur when scales or bias arrive in unexpected dtypes from the
+    # ComfyUI model management / device offload pipeline
+    a_fp32 = a_fp32.to(torch.float32)
+    b_fp32 = b_fp32.to(torch.float32)
+    if bias is not None:
+        bias = bias.to(torch.float32)
 
     output = torch.nn.functional.linear(a_fp32, b_fp32, bias)
     return output
@@ -569,6 +577,13 @@ def int8_linear(func, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
+    # Ensure consistent dtypes after dequantization to prevent BFloat16/Float mismatches
+    target_dtype = input_tensor.dtype
+    if weight.dtype != target_dtype:
+        weight = weight.to(target_dtype)
+    if bias is not None and bias.dtype != target_dtype:
+        bias = bias.to(target_dtype)
+
     return torch.nn.functional.linear(input_tensor, weight, bias)
 
 
@@ -582,6 +597,10 @@ def int8_mm(func, args, kwargs):
         weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
+
+    # Ensure consistent dtypes after dequantization
+    if input_tensor.dtype != weight.dtype:
+        weight = weight.to(input_tensor.dtype)
 
     return func(input_tensor, weight)
 
@@ -599,6 +618,13 @@ def int8_addmm(func, args, kwargs):
         input_tensor = input_tensor.dequantize()
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
+
+    # Ensure consistent dtypes after dequantization
+    target_dtype = input_tensor.dtype
+    if weight.dtype != target_dtype:
+        weight = weight.to(target_dtype)
+    if bias.dtype != target_dtype:
+        bias = bias.to(target_dtype)
 
     return func(bias, input_tensor, weight, **kwargs)
 
