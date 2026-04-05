@@ -20,6 +20,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+dependencies = [
+    "unifiedefficientloader>=0.2.0"
+]
 
 [project.urls]
 Repository = "https://github.com/silveroxides/ComfyUI-QuantOps"

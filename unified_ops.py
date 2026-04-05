@@ -14,14 +14,19 @@ import torch.nn.functional as F
 from comfy.ops import manual_cast, cast_bias_weight, uncast_bias_weight
 from comfy.quant_ops import QuantizedTensor, QUANT_ALGOS, get_layout_class
 from comfy.model_patcher import LowVramPatch
+from unifiedefficientloader import tensor_to_dict
 
 # Try to import INT8 layouts
 try:
-    from .quant_layouts.int8_layout import BlockWiseINT8Layout
+    from comfy_kitchen.tensor.int8 import BlockWiseINT8Layout
     _HAS_INT8_LAYOUT = True
 except ImportError:
-    _HAS_INT8_LAYOUT = False
-    logging.warning("INT8 blockwise layout not available")
+    try:
+        from .quant_layouts.int8_layout import BlockWiseINT8Layout
+        _HAS_INT8_LAYOUT = True
+    except ImportError:
+        _HAS_INT8_LAYOUT = False
+        logging.warning("INT8 blockwise layout not available")
 
 try:
     from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
@@ -29,22 +34,6 @@ try:
 except ImportError:
     _HAS_TENSORWISE_INT8_LAYOUT = False
     logging.warning("INT8 tensorwise layout not available from comfy_kitchen")
-
-
-def tensor_to_dict(tensor_data: torch.Tensor) -> dict:
-    """
-    Convert a torch.uint8 tensor containing JSON bytes to a dictionary.
-    """
-    try:
-        if tensor_data.dtype == torch.uint8:
-            byte_data = bytes(tensor_data.tolist())
-            json_str = byte_data.decode("utf-8")
-            return json.loads(json_str)
-        else:
-            return {}
-    except Exception as e:
-        logging.debug(f"Failed to parse comfy_quant metadata using tensor_to_dict: {e}")
-        return {}
 
 
 class UnifiedQuantOps(manual_cast):

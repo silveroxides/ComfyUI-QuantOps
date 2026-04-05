@@ -409,6 +409,12 @@ def _int8_gemm_pytorch_fallback(
     b_fp32 = b_blocked.to(torch.float32) * b_scale_broadcast
     b_fp32 = b_fp32.permute(0, 2, 1, 3).reshape(N, K)
 
+    # Bias may arrive in bfloat16 when previous layers (e.g. TensorWiseINT8Layout)
+    # output bfloat16 and cast_bias_weight matches the input dtype.
+    # The INT8 fallback computes in float32, so bias must match.
+    if bias is not None and bias.dtype != a_fp32.dtype:
+        bias = bias.to(a_fp32.dtype)
+
     output = torch.nn.functional.linear(a_fp32, b_fp32, bias)
     return output
 
