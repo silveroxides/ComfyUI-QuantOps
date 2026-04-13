@@ -139,12 +139,16 @@ class UnifiedQuantOps:
                         )
 
                     layout_params = TensorCoreNVFP4Layout.Params(
-                        scale=scale_2.to(torch.float32)
+                        scale=scale_2.to(
+                            device=weight_tensor.device, dtype=torch.float32
+                        )
                         if scale_2 is not None
-                        else torch.tensor(1.0),
+                        else torch.tensor(1.0, device=weight_tensor.device),
                         orig_dtype=orig_dtype,
                         orig_shape=orig_shape,
-                        block_scale=scale,
+                        block_scale=scale.to(device=weight_tensor.device)
+                        if scale is not None
+                        else None,
                     )
 
                     self.weight = torch.nn.Parameter(
@@ -174,7 +178,9 @@ class UnifiedQuantOps:
                     if is_tensorwise and _HAS_TENSORWISE_INT8_LAYOUT:
                         self.layout_type = "TensorWiseINT8Layout"
                         layout_params = TensorWiseINT8Layout.Params(
-                            scale=scale.to(torch.float32)
+                            scale=scale.to(
+                                device=weight_tensor.device, dtype=torch.float32
+                            )
                             if scale is not None
                             else None,
                             orig_dtype=torch.bfloat16,
@@ -190,7 +196,9 @@ class UnifiedQuantOps:
                     elif not is_tensorwise and _HAS_INT8_LAYOUT:
                         self.layout_type = "BlockWiseINT8Layout"
                         layout_params = BlockWiseINT8Layout.Params(
-                            scale=scale.to(torch.float32)
+                            scale=scale.to(
+                                device=weight_tensor.device, dtype=torch.float32
+                            )
                             if scale is not None
                             else None,
                             orig_dtype=torch.bfloat16,
@@ -279,7 +287,9 @@ class UnifiedQuantOps:
                             from comfy_kitchen.tensor import HybridMXFP8Layout
 
                             layout_params = HybridMXFP8Layout.Params(
-                                scale=scale,
+                                scale=scale.to(device=weight_tensor.device)
+                                if scale is not None
+                                else None,
                                 orig_dtype=orig_dtype,
                                 orig_shape=orig_shape,
                                 scalar=scalar,
@@ -288,7 +298,9 @@ class UnifiedQuantOps:
                             from comfy_kitchen.tensor import TensorCoreMXFP8Layout
 
                             layout_params = TensorCoreMXFP8Layout.Params(
-                                scale=scale,
+                                scale=scale.to(device=weight_tensor.device)
+                                if scale is not None
+                                else None,
                                 orig_dtype=orig_dtype,
                                 orig_shape=orig_shape,
                             )
@@ -299,7 +311,9 @@ class UnifiedQuantOps:
                             self.block_size if self.block_size is not None else 64
                         )
                         layout_params = BlockWiseFP8Layout.Params(
-                            scale=scale.to(torch.float32)
+                            scale=scale.to(
+                                device=weight_tensor.device, dtype=torch.float32
+                            )
                             if scale is not None
                             else None,
                             orig_dtype=torch.bfloat16,
@@ -310,7 +324,9 @@ class UnifiedQuantOps:
                         from .quant_layouts.fp8_variants import RowWiseFP8Layout
 
                         layout_params = RowWiseFP8Layout.Params(
-                            scale=scale.to(torch.float32)
+                            scale=scale.to(
+                                device=weight_tensor.device, dtype=torch.float32
+                            )
                             if scale is not None
                             else None,
                             orig_dtype=torch.bfloat16,
@@ -320,7 +336,9 @@ class UnifiedQuantOps:
                         from comfy.quant_ops import TensorCoreFP8Layout
 
                         layout_params = TensorCoreFP8Layout.Params(
-                            scale=scale.to(torch.float32)
+                            scale=scale.to(
+                                device=weight_tensor.device, dtype=torch.float32
+                            )
                             if scale is not None
                             else None,
                             orig_dtype=torch.bfloat16,
@@ -478,11 +496,52 @@ class UnifiedQuantOps:
             Instead of dequantizing the full weight, we run native INT8 matmul
             for the base model and compute LoRA contribution separately.
             """
-            weight = self.weight
-            if isinstance(weight, torch.nn.Parameter):
-                weight = weight.data
-
             input_dtype = input.dtype
+
+            saved_wf = getattr(self, "weight_function", [])
+            saved_wlf = getattr(self, "weight_lowvram_function", None)
+            saved_bf = getattr(self, "bias_function", [])
+            saved_blf = getattr(self, "bias_lowvram_function", None)
+
+            self.weight_function = []
+            if saved_wlf is not None:
+                self.weight_lowvram_function = None
+            if hasattr(self, "bias_function"):
+                self.bias_function = []
+            if saved_blf is not None:
+                self.bias_lowvram_function = None
+
+            try:
+                cast_dtype = (
+                    self.weight._qdata.dtype
+                    if isinstance(self.weight, QuantizedTensor)
+                    else None
+                )
+                weight, bias, offload_stream = cast_bias_weight(
+                    self,
+                    input,
+                    dtype=cast_dtype,
+                    bias_dtype=input_dtype,
+                    offloadable=True,
+                )
+            finally:
+                self.weight_function = saved_wf
+                if saved_wlf is not None:
+                    self.weight_lowvram_function = saved_wlf
+                if hasattr(self, "bias_function"):
+                    self.bias_function = saved_bf
+                if saved_blf is not None:
+                    self.bias_lowvram_function = saved_blf
+
+            # Re-wrap if stripped by ComfyUI
+            if (
+                not isinstance(weight, QuantizedTensor)
+                and getattr(self, "layout_type", None) is not None
+            ):
+                if isinstance(self.weight, QuantizedTensor):
+                    weight = QuantizedTensor(
+                        weight, self.layout_type, self.weight._params
+                    )
 
             if not hasattr(UnifiedQuantOps.Linear, "_fused_lora_log_count"):
                 UnifiedQuantOps.Linear._fused_lora_log_count = 0
@@ -493,8 +552,6 @@ class UnifiedQuantOps:
                 UnifiedQuantOps.Linear._fused_lora_log_count += 1
 
             if isinstance(weight, QuantizedTensor):
-                if weight.device != input.device:
-                    weight = weight.to(device=input.device)
                 if hasattr(weight, "_params"):
                     object.__setattr__(weight._params, "orig_dtype", input_dtype)
 
@@ -503,7 +560,12 @@ class UnifiedQuantOps:
                 base_out = F.linear(input.to(weight.dtype), weight, None)
 
             lora_out = None
-            for patch_fn in self.weight_function:
+
+            patches_to_process = list(saved_wf)
+            if saved_wlf is not None and saved_wlf not in patches_to_process:
+                patches_to_process.append(saved_wlf)
+
+            for patch_fn in patches_to_process:
                 if isinstance(patch_fn, LowVramPatch):
                     patches = patch_fn.patches.get(patch_fn.key, [])
                     for patch_data in patches:
@@ -552,7 +614,7 @@ class UnifiedQuantOps:
                                 weight_fp = self.weight.data.to(
                                     device=input.device, dtype=input_dtype
                                 )
-                            patched_weight = patch_fn(weight_fp)
+                            patched_weight = patch_fn(weight_fp.clone())
                             lora_contrib = F.linear(
                                 input, patched_weight - weight_fp, None
                             )
@@ -570,7 +632,7 @@ class UnifiedQuantOps:
                         weight_fp = self.weight.data.to(
                             device=input.device, dtype=input_dtype
                         )
-                    patched_weight = patch_fn(weight_fp)
+                    patched_weight = patch_fn(weight_fp.clone())
                     lora_contrib = F.linear(input, patched_weight - weight_fp, None)
                     if lora_out is None:
                         lora_out = lora_contrib
@@ -582,9 +644,11 @@ class UnifiedQuantOps:
                 out = out + lora_out
 
             if self.bias is not None:
-                bias = self.bias.to(device=input.device, dtype=input_dtype)
+                if bias is None:
+                    bias = self.bias.to(device=input.device, dtype=input_dtype)
                 out = out + bias
 
+            uncast_bias_weight(self, weight, bias, offload_stream)
             return out
 
         def forward(self, *args, **kwargs):
@@ -598,6 +662,13 @@ class UnifiedQuantOps:
             is_int8 = isinstance(weight, QuantizedTensor) and getattr(
                 self, "layout_type", None
             ) in ["BlockWiseINT8Layout", "TensorWiseINT8Layout"]
+
+            # ComfyUI dynamically adds <param>_lowvram_function patches to the module when dynamic VRAM is off
+            # and lowvram models are loaded. We need to catch these as well for fused LoRA
+            lowvram_fn = getattr(self, "weight_lowvram_function", None)
+            if lowvram_fn is not None and len(self.weight_function) == 0:
+                self.weight_function = [lowvram_fn]
+                has_lora = True
 
             if has_lora and is_int8:
                 return self.forward_fused_lora(*args, **kwargs)
