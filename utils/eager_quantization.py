@@ -56,6 +56,19 @@ def int8_linear(
         logging.warning(f"ComfyUI-QuantOps: ck.int8_linear failed, falling back to local path: {e}")
 
     # --- Local fallback: chunked torch.int8_mm path (OOM-safe) ---
+    # Unwrap QuantizedTensor if weight arrived still wrapped (defensive).
+    try:
+        from comfy.quant_ops import QuantizedTensor
+        if isinstance(weight, QuantizedTensor):
+            weight_scale = weight._params.scale
+            weight = weight._qdata
+    except ImportError:
+        pass
+
+    # Ensure weight is raw int8 and contiguous before torch.int8_mm.
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 
