@@ -35,13 +35,24 @@ def int8_linear(
     bias: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """INT8 linear layer using torch.int8_mm for direct quantized matmul.
-    
-    Uses native torch.int8_mm which avoids materializing large float32 intermediates
-    and handles scaling more efficiently than manual int32 -> float32 conversion.
-    
-    Ported from comfy-kitchen eager backend with OOM fixes.
+    """INT8 linear layer. Delegates to comfy_kitchen.int8_linear (triton->eager)
+    when available, falls back to local torch.int8_mm chunked path.
+
+    ck.int8_linear signature matches exactly:
+        (x, weight, weight_scale, bias=None, out_dtype=None)
+    weight: [N, K] int8, weight_scale: scalar float32, out_dtype defaults bfloat16.
     """
+    # Prefer comfy_kitchen dispatch (triton -> eager via registry).
+    # ck.int8_linear routes through torch.ops.comfy_kitchen.int8_linear which
+    # goes through the registry with priority ["cuda", "triton", "eager"].
+    # cuda backend has no int8_linear, so triton wins if available, else eager.
+    try:
+        import comfy_kitchen as ck
+        return ck.int8_linear(x, weight, weight_scale, bias, out_dtype)
+    except (ImportError, Exception):
+        pass
+
+    # --- Local fallback: chunked torch.int8_mm path (OOM-safe) ---
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
 

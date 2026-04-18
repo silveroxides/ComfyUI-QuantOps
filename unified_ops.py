@@ -173,11 +173,14 @@ class UnifiedQuantOps:
 
                     if is_tensorwise and _HAS_TENSORWISE_INT8_LAYOUT:
                         self.layout_type = "TensorWiseINT8Layout"
+                        _orig_dtype_str = layer_conf.get("orig_dtype", "torch.bfloat16") if layer_conf else "torch.bfloat16"
+                        _DTYPE_MAP = {"torch.bfloat16": torch.bfloat16, "torch.float16": torch.float16, "torch.float32": torch.float32}
+                        _orig_dtype = _DTYPE_MAP.get(_orig_dtype_str, torch.bfloat16)
                         layout_params = TensorWiseINT8Layout.Params(
                             scale=scale.to(torch.float32)
                             if scale is not None
                             else None,
-                            orig_dtype=torch.bfloat16,
+                            orig_dtype=_orig_dtype,
                             orig_shape=tuple(weight_tensor.shape),
                             is_weight=True,
                         )
@@ -205,6 +208,14 @@ class UnifiedQuantOps:
                             requires_grad=False,
                         )
                     else:
+                        # TODO (#2 — medium severity, low risk): this branch fires when
+                        # is_tensorwise=True but _HAS_TENSORWISE_INT8_LAYOUT=False (ck absent).
+                        # Result: raw int8 tensor stored with is_quantized=True, layout_type=None.
+                        # That is a broken state — forward() will hit F.linear with raw int8 weight.
+                        # Fix: degrade to BlockWiseINT8Layout if _HAS_INT8_LAYOUT, else set
+                        # is_quantized=False and log a warning. Not patching now because ck is
+                        # effectively required for tensorwise; if ck import failed the checkpoint
+                        # is already unrunnable regardless.
                         self.weight = torch.nn.Parameter(
                             weight_tensor, requires_grad=False
                         )
@@ -463,7 +474,19 @@ class UnifiedQuantOps:
                         )
 
                 else:
-                    # Default trigger for QuantizedTensor dispatch -> layout-specific handler
+                    # Default trigger for QuantizedTensor dispatch -> layout-specific handler.
+                    # TensorWiseINT8Layout and BlockWiseINT8Layout land here — aten.linear
+                    # dispatch in comfy_kitchen handles the actual matmul.
+                    #
+                    # TODO (#3 — low-medium severity, medium risk): this else branch has no 3D
+                    # input reshape guard, unlike all the explicit elif branches above. ComfyUI
+                    # transformer attention layers pass [batch, seq, hidden] (3D). F.linear
+                    # handles 3D natively so it works, but ck dispatch handlers may not. If
+                    # tensorwise inference produces wrong shapes on 3D inputs, add the standard
+                    # tensor_3d guard here (reshape -1,hidden before linear, reshape back after).
+                    # Not patching now — risk of breaking currently-working layouts that fall
+                    # through to this branch (e.g. RowWiseFP8, BlockWiseFP8 if aten dispatch
+                    # handles them here too).
                     out = torch.nn.functional.linear(input, weight, bias)
 
             else:
