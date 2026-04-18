@@ -49,8 +49,11 @@ def int8_linear(
     try:
         import comfy_kitchen as ck
         return ck.int8_linear(x, weight, weight_scale, bias, out_dtype)
-    except (ImportError, Exception):
+    except ImportError:
         pass
+    except Exception as e:
+        import logging
+        logging.warning(f"ComfyUI-QuantOps: ck.int8_linear failed, falling back to local path: {e}")
 
     # --- Local fallback: chunked torch.int8_mm path (OOM-safe) ---
     orig_shape = x.shape
