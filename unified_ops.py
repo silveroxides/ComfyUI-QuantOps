@@ -623,7 +623,8 @@ class UnifiedQuantOps:
                 weight = QuantizedTensor.from_float(
                     weight,
                     self.layout_type,
-                    scale="recalculate",
+                    scale=None,
+                    is_weight=True,
                     stochastic_rounding=seed if seed else 0,
                     inplace_ops=True,
                 )
