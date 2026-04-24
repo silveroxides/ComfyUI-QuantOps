@@ -345,13 +345,15 @@ class UnifiedQuantOps:
             else:
                 self.bias = None
 
-        def forward_comfy_cast_weights(self, input):
+        def forward_comfy_cast_weights(self, input, compute_dtype=None, want_requant=False):
             """Forward pass for QuantizedTensors or raw quantified formats."""
             weight = self.weight
             if isinstance(weight, torch.nn.Parameter):
                 weight = weight.data
 
             input_dtype = input.dtype
+            if compute_dtype is None:
+                compute_dtype = input_dtype
 
             is_quantized_fast_path = isinstance(weight, QuantizedTensor)
             cast_dtype = weight.dtype if is_quantized_fast_path else None
@@ -362,6 +364,8 @@ class UnifiedQuantOps:
                 input,
                 dtype=cast_dtype,
                 bias_dtype=cast_bias_dtype,
+                compute_dtype=compute_dtype,
+                want_requant=want_requant,
                 offloadable=True,
             )
 
@@ -587,29 +591,57 @@ class UnifiedQuantOps:
 
             return out
 
-        def forward(self, *args, **kwargs):
+        def forward(self, input, *args, **kwargs):
             weight = self.weight
             if isinstance(weight, torch.nn.Parameter):
                 weight = weight.data
 
             has_lora = len(self.weight_function) > 0
 
-            # Use fused LoRA only if it's an INT8 quantized tensor
-            is_int8 = isinstance(weight, QuantizedTensor) and getattr(
-                self, "layout_type", None
-            ) in ["BlockWiseINT8Layout", "TensorWiseINT8Layout"]
-
-            if has_lora and is_int8:
-                return self.forward_fused_lora(*args, **kwargs)
-            elif (
+            if not (
                 self.comfy_cast_weights
                 or has_lora
                 or len(self.bias_function) > 0
                 or isinstance(weight, QuantizedTensor)
             ):
-                return self.forward_comfy_cast_weights(*args, **kwargs)
-            else:
-                return super().forward(*args, **kwargs)
+                return super().forward(input, *args, **kwargs)
+
+            input_shape = input.shape
+            orig_input_dtype = input.dtype
+            reshaped_3d = False
+
+            # Quantize input when: quantized layer, no LoRA active, no bias_function,
+            # not force-cast. This makes want_requant=True so vbar bakes the
+            # dequant+LoRA weight into the resident cache on the first non-resident call.
+            _use_quantized = (
+                isinstance(weight, QuantizedTensor) and
+                not isinstance(input, QuantizedTensor) and
+                not getattr(self, "comfy_force_cast_weights", False) and
+                not has_lora and
+                not len(self.bias_function) and
+                getattr(self, "layout_type", None) is not None
+            )
+
+            if _use_quantized:
+                input_reshaped = input.reshape(-1, input_shape[-1]) if input.ndim == 3 else input
+                if input_reshaped.ndim == 2:
+                    reshaped_3d = input.ndim == 3
+                    scale = getattr(self, "input_scale", None)
+                    if scale is not None:
+                        import comfy.model_management
+                        scale = comfy.model_management.cast_to_device(scale, input.device, None)
+                    input = QuantizedTensor.from_float(input_reshaped, self.layout_type, scale=scale)
+
+            out = self.forward_comfy_cast_weights(
+                input,
+                compute_dtype=orig_input_dtype,
+                want_requant=isinstance(input, QuantizedTensor),
+            )
+
+            if reshaped_3d:
+                out = out.reshape(input_shape[0], input_shape[1], weight.shape[0])
+
+            return out
 
         def convert_weight(self, weight, inplace=False, **kwargs):
             if isinstance(weight, QuantizedTensor):
@@ -619,15 +651,22 @@ class UnifiedQuantOps:
         def set_weight(
             self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs
         ):
-            if getattr(self, "layout_type", None) is not None:
-                weight = QuantizedTensor.from_float(
-                    weight,
-                    self.layout_type,
-                    scale=None,
-                    is_weight=True,
-                    stochastic_rounding=seed if seed else 0,
-                    inplace_ops=True,
-                )
+            lt = getattr(self, "layout_type", None)
+            if lt is not None:
+                if lt == "TensorWiseINT8Layout":
+                    weight = QuantizedTensor.from_float(weight, lt, is_weight=True)
+                elif lt == "BlockWiseINT8Layout":
+                    weight = QuantizedTensor.from_float(
+                        weight, lt, is_weight=True, block_size=self.block_size or 128
+                    )
+                else:
+                    # FP8 / MXFP8 / NVFP4
+                    weight = QuantizedTensor.from_float(
+                        weight, lt,
+                        scale="recalculate",
+                        stochastic_rounding=seed if seed else 0,
+                        inplace_ops=True,
+                    )
                 if hasattr(self.weight, "dtype"):
                     weight = weight.to(self.weight.dtype)
             else:
