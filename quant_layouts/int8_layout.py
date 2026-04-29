@@ -12,6 +12,10 @@ import logging
 from dataclasses import dataclass
 from typing import Tuple, Optional
 
+from ..utils.logging_utils import get_one_time_logger
+
+logger = get_one_time_logger(__name__)
+
 # Import from ComfyUI core (which re-exports from comfy_kitchen)
 from comfy.quant_ops import QuantizedTensor, register_layout_op
 
@@ -31,7 +35,7 @@ _triton_functions = {}
 def _check_triton_available():
     """
     Check and cache Triton INT8 kernel availability.
-    
+
     Priority:
     1. Check comfy-kitchen triton backend (if ck is available)
     2. Fall back to independent Triton import check
@@ -72,10 +76,10 @@ def _check_triton_available():
         _triton_functions["int8_gemm"] = triton_int8_gemm
         _triton_functions["int8_addmm"] = triton_int8_addmm
         _triton_int8_available = True
-        logging.info("Triton INT8 kernels loaded successfully")
+        logger.info("Triton INT8 kernels loaded successfully")
     except ImportError as e:
         _triton_int8_available = False
-        logging.info(f"Triton INT8 kernels not available: {e}")
+        logger.info(f"Triton INT8 kernels not available: {e}")
 
     return _triton_int8_available
 
@@ -157,7 +161,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                     weight_quant = _get_triton_function("weight_quant")
                     qdata, scale = weight_quant(tensor, block_size=block_size)
                 except Exception as e:
-                    logging.warning(
+                    logger.warning(
                         f"Triton weight_quant failed: {e}, falling back to PyTorch"
                     )
                     qdata, scale = cls._weight_quantize_pytorch(
@@ -176,7 +180,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                     act_quant = _get_triton_function("act_quant")
                     qdata, scale = act_quant(tensor, block_size=block_size)
                 except Exception as e:
-                    logging.warning(
+                    logger.warning(
                         f"Triton act_quant failed: {e}, falling back to PyTorch"
                     )
                     qdata, scale = cls._activation_quantize_pytorch(tensor, block_size)
@@ -245,7 +249,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
         block_size = params.block_size
         is_weight = params.is_weight
         orig_dtype = params.orig_dtype
-        
+
         if not qdata.is_contiguous():
             qdata = qdata.contiguous()
         if not scale.is_contiguous():
@@ -262,7 +266,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                         qdata, scale, block_size=block_size, output_dtype=output_dt
                     )
                 except Exception as e:
-                    logging.warning(
+                    logger.warning(
                         f"Triton weight_dequant failed: {e}, falling back to PyTorch"
                     )
 
@@ -293,7 +297,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                         qdata, scale, block_size=block_size, output_dtype=output_dt
                     )
                 except Exception as e:
-                    logging.warning(
+                    logger.warning(
                         f"Triton act_dequant failed: {e}, falling back to PyTorch"
                     )
 
@@ -347,24 +351,24 @@ def _log_int8_path(path_type, input_shape, weight_shape, reason=None):
 
     if count < _LOG_LIMIT:
         if path_type == "NATIVE_TRITON":
-            logging.info(
+            logger.info(
                 f"INT8: Native Triton matmul - input={input_shape}, weight={weight_shape}"
             )
         elif path_type == "PYTORCH_BOTH_QUANT":
-            logging.info(
+            logger.info(
                 f"INT8: PyTorch fallback (both quantized) - input={input_shape}, weight={weight_shape}"
             )
         elif path_type == "DYNAMIC_ACT_QUANT":
-            logging.info(
+            logger.info(
                 f"INT8: Dynamic activation quant - input={input_shape}, weight={weight_shape}"
             )
         elif path_type == "DEQUANT_FALLBACK":
-            logging.warning(
+            logger.warning(
                 f"INT8: Dequant fallback ({reason}) - input={input_shape}, weight={weight_shape}. "
                 f"Native INT8 matmul NOT used - only memory savings, no compute speedup."
             )
     elif count == _LOG_LIMIT:
-        logging.info(
+        logger.info(
             f"INT8: Suppressing further '{path_type}' logs (limit={_LOG_LIMIT})"
         )
 
@@ -467,7 +471,7 @@ def int8_linear(func, args, kwargs):
                 _log_int8_path("NATIVE_TRITON", a_int8.shape, b_int8.shape)
                 return result.reshape(*input_tensor.shape[:-1], weight.shape[0])
             except Exception as e:
-                logging.warning(
+                logger.warning(
                     f"Triton INT8 matmul failed: {e}, falling back to PyTorch"
                 )
 
@@ -484,17 +488,17 @@ def int8_linear(func, args, kwargs):
     if isinstance(weight, QuantizedTensor) and not isinstance(input_tensor, QuantizedTensor):
         b_int8, b_scale, b_block_size, _ = BlockWiseINT8Layout.get_plain_tensors(weight)
         out_dtype = weight._params.orig_dtype
-        
+
         # Ensure input is contiguous and on same device
         if not input_tensor.is_contiguous():
             input_tensor = input_tensor.contiguous()
         if input_tensor.device != b_int8.device:
             input_tensor = input_tensor.to(b_int8.device)
-        
+
         # Dynamically quantize input activation to INT8
         orig_shape = input_tensor.shape
         K = input_tensor.shape[-1]
-        
+
         # Check if K is divisible by block_size, pad if needed
         if K % b_block_size != 0:
             # Fall back to dequant if dimensions don't align
@@ -506,7 +510,7 @@ def int8_linear(func, args, kwargs):
             )
             weight_dequant = weight.dequantize()
             return torch.nn.functional.linear(input_tensor, weight_dequant, bias)
-        
+
         # Quantize activation on-the-fly
         a_int8, a_params = BlockWiseINT8Layout.quantize(
             input_tensor,
@@ -514,9 +518,9 @@ def int8_linear(func, args, kwargs):
             is_weight=False
         )
         a_scale = a_params.scale
-        
+
         _log_int8_path("DYNAMIC_ACT_QUANT", a_int8.shape, b_int8.shape)
-        
+
         # Try Triton path
         if BlockWiseINT8Layout.use_triton and a_int8.is_cuda:
             try:
@@ -546,10 +550,10 @@ def int8_linear(func, args, kwargs):
 
                 return result.reshape(*orig_shape[:-1], weight.shape[0])
             except Exception as e:
-                logging.warning(
+                logger.warning(
                     f"Triton INT8 matmul failed: {e}, using PyTorch fallback"
                 )
-        
+
         # PyTorch fallback for dynamic quant path
         output = _int8_gemm_pytorch_fallback(
             a_int8, a_scale, b_int8, b_scale, b_block_size, bias

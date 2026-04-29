@@ -14,6 +14,10 @@ import logging
 from dataclasses import dataclass
 from typing import Tuple, Optional
 
+from ..utils.logging_utils import get_one_time_logger
+
+logger = get_one_time_logger(__name__)
+
 # Import from ComfyUI core (which re-exports from comfy_kitchen)
 from comfy.quant_ops import QuantizedTensor, register_layout_op
 
@@ -34,7 +38,7 @@ def _should_use_fp8_kernels():
             return True
     except ImportError:
         pass
-    
+
     # Fall back to independent check
     try:
         from ..kernels.fp8_kernels import _check_triton_available
@@ -56,7 +60,7 @@ try:
     _HAS_FP8_KERNELS = _should_use_fp8_kernels()
 except ImportError:
     _HAS_FP8_KERNELS = False
-    logging.debug("FP8 Triton kernels not available, using dequantize fallback")
+    logger.debug("FP8 Triton kernels not available, using dequantize fallback")
 
 
 class RowWiseFP8Layout(QuantizedLayout):
@@ -124,7 +128,7 @@ class RowWiseFP8Layout(QuantizedLayout):
         """Dequantize FP8 tensor with row-wise scaling."""
         scale = params.scale
         orig_dtype = params.orig_dtype
-        
+
         # Convert to target dtype (matching core ComfyUI pattern)
         plain_tensor = torch.ops.aten._to_copy.default(qdata, dtype=orig_dtype)
         # Cast scale to orig_dtype before in-place multiply to preserve output dtype
@@ -220,7 +224,7 @@ class BlockWiseFP8Layout(QuantizedLayout):
         scale = params.scale
         block_size = params.block_size
         orig_dtype = params.orig_dtype
-        
+
         M, N = qdata.shape
 
         # Reshape to blocks
@@ -286,7 +290,7 @@ def rowwise_fp8_linear(func, args, kwargs):
                         dtype=w_qdata.dtype,
                     )
 
-                    logging.debug(
+                    logger.debug(
                         f"FP8 rowwise: Native kernel (dynamic quant), "
                         f"input={a_qdata.shape}, weight={w_qdata.shape}"
                     )
@@ -307,10 +311,10 @@ def rowwise_fp8_linear(func, args, kwargs):
 
                     return result.to(orig_dtype)
                 except Exception as e:
-                    logging.warning(f"FP8 rowwise native kernel failed: {e}")
+                    logger.warning(f"FP8 rowwise native kernel failed: {e}")
 
     # Fallback: dequantize
-    logging.debug("FP8 rowwise: Using dequant fallback")
+    logger.debug("FP8 rowwise: Using dequant fallback")
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
@@ -385,7 +389,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                     input_tensor
                 )
 
-                logging.debug(
+                logger.debug(
                     f"FP8 blockwise: Native kernel (both quantized), "
                     f"input={a_qdata.shape}, weight={w_qdata.shape}, block_size={w_block_size}"
                 )
@@ -410,7 +414,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                         )
                     return result.to(orig_dtype)
                 except Exception as e:
-                    logging.warning(
+                    logger.warning(
                         f"FP8 native kernel failed, falling back to dequant: {e}"
                     )
 
@@ -424,7 +428,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                         dtype=w_qdata.dtype,
                     )
 
-                    logging.debug(
+                    logger.debug(
                         f"FP8 blockwise: Native kernel (dynamic quant), "
                         f"input={a_qdata.shape}, weight={w_qdata.shape}"
                     )
@@ -448,12 +452,12 @@ def blockwise_fp8_linear(func, args, kwargs):
                         )
                     return result.to(orig_dtype)
                 except Exception as e:
-                    logging.warning(
+                    logger.warning(
                         f"FP8 dynamic quant failed, falling back to dequant: {e}"
                     )
 
     # Fallback: dequantize
-    logging.debug("FP8 blockwise: Using dequant fallback")
+    logger.debug("FP8 blockwise: Using dequant fallback")
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):

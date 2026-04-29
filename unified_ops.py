@@ -16,6 +16,10 @@ from comfy.quant_ops import QuantizedTensor, QUANT_ALGOS, get_layout_class
 from comfy.model_patcher import LowVramPatch
 from unifiedefficientloader import tensor_to_dict
 
+from .utils.logging_utils import get_one_time_logger
+
+logger = get_one_time_logger(__name__)
+
 # Try to import INT8 layouts
 try:
     from comfy_kitchen.tensor.int8 import BlockWiseINT8Layout
@@ -28,7 +32,7 @@ except ImportError:
         _HAS_INT8_LAYOUT = True
     except ImportError:
         _HAS_INT8_LAYOUT = False
-        logging.warning("INT8 blockwise layout not available")
+        logger.warning("INT8 blockwise layout not available")
 
 try:
     from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
@@ -36,7 +40,7 @@ try:
     _HAS_TENSORWISE_INT8_LAYOUT = True
 except ImportError:
     _HAS_TENSORWISE_INT8_LAYOUT = False
-    logging.warning("INT8 tensorwise layout not available from comfy_kitchen")
+    logger.warning("INT8 tensorwise layout not available from comfy_kitchen")
 
 
 class UnifiedQuantOps:
@@ -487,7 +491,7 @@ class UnifiedQuantOps:
             if not hasattr(UnifiedQuantOps.Linear, "_fused_lora_log_count"):
                 UnifiedQuantOps.Linear._fused_lora_log_count = 0
             if UnifiedQuantOps.Linear._fused_lora_log_count < 3:
-                logging.info(
+                logger.info(
                     f"INT8: Using fused LoRA path - input={input.shape}, weight={weight.shape if hasattr(weight, 'shape') else getattr(weight, '_qdata', weight).shape}"
                 )
                 UnifiedQuantOps.Linear._fused_lora_log_count += 1
@@ -523,7 +527,7 @@ class UnifiedQuantOps:
                                 mat1.shape[0] != weight.shape[0]
                                 or mat2.shape[1] != weight.shape[1]
                             ):
-                                logging.warning(
+                                logger.warning(
                                     f"INT8 Fused LoRA shape mismatch: weight={weight.shape}, lora_up={mat1.shape}, lora_down={mat2.shape}. Skipping patch."
                                 )
                                 continue
@@ -541,7 +545,7 @@ class UnifiedQuantOps:
                             else:
                                 lora_out = lora_out + lora_contrib
                         else:
-                            logging.warning(
+                            logger.warning(
                                 f"INT8 Fused LoRA: Falling back to dequant for non-LoRA adapter"
                             )
                             if isinstance(self.weight.data, QuantizedTensor):
@@ -561,7 +565,7 @@ class UnifiedQuantOps:
                             else:
                                 lora_out = lora_out + lora_contrib
                 else:
-                    logging.warning(
+                    logger.warning(
                         f"INT8 Fused LoRA: Unknown patch function type, falling back"
                     )
                     if isinstance(self.weight.data, QuantizedTensor):
