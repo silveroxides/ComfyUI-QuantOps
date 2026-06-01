@@ -91,15 +91,13 @@ def _register_layouts():
         register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
         register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
 
-        # Tensorwise INT8 from comfy_kitchen
+        # Tensorwise INT8 (Comfy-Kitchen or Fallback)
         try:
-            from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
+            from .quant_layouts.tensorwise_int8_layout import TensorWiseINT8Layout
             register_layout_class("TensorWiseINT8Layout", TensorWiseINT8Layout)
-            # Load our patch for per-channel scale support
-            from .quant_layouts import tensorwise_int8_layout
             logging.info("ComfyUI-QuantOps: Registered TensorWiseINT8Layout")
-        except ImportError:
-            logging.debug("ComfyUI-QuantOps: TensorWiseINT8Layout not available")
+        except ImportError as e:
+            logging.debug(f"ComfyUI-QuantOps: TensorWiseINT8Layout not available: {e}")
 
         # Register QUANT_ALGOS
         QUANT_ALGOS.setdefault(

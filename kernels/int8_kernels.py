@@ -1349,14 +1349,15 @@ def _quantize_rowwise_kernel(
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    x = tl.load(x_row_ptr + offsets, mask=mask, other=0.0)
+    x = tl.load(x_row_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     abs_x = tl.abs(x)
     max_val = tl.max(abs_x, axis=0)
     scale = tl.maximum(max_val / 127.0, 1e-30)
 
     q_f = x / scale
-    q_i = _libdevice.rint(q_f).to(tl.int32)
-    q_i = tl.clamp(q_i, -128.0, 127.0)
+    # Rounded to nearest integer. 
+    q_i = tl.math.round(q_f).to(tl.int32)
+    q_i = tl.clamp(q_i, -128, 127)
 
     tl.store(y_row_ptr + offsets, q_i.to(tl.int8), mask=mask)
     tl.store(s_ptr + row_idx, scale.to(tl.float32))
@@ -1435,8 +1436,11 @@ def _int8_matmul_dequant_per_row_kernel(
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     for k in range(0, tl.cdiv(K, BLOCK_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_K, other=0.0)
+        # Load chunks with masking for K dimension
+        k_mask = (offs_k < K - k * BLOCK_K)
+        # Load as int8 for dot (using other=0 int)
+        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0).to(tl.int8)
+        b = tl.load(b_ptrs, mask=k_mask[:, None], other=0).to(tl.int8)
         accumulator += tl.dot(a, b)
         a_ptrs += BLOCK_K * stride_ak
         b_ptrs += BLOCK_K * stride_bk
@@ -1445,9 +1449,9 @@ def _int8_matmul_dequant_per_row_kernel(
     scale_a = tl.load(a_scale_ptr + offs_am)   # [BLOCK_M]
     scale_b = tl.load(b_scale_ptr + offs_bn)   # [BLOCK_N]
 
-    c = accumulator.to(tl.float32)
+    # Combine scales: scale_a (broadcast columns) * scale_b
     total_scale = scale_a[:, None] * scale_b[None, :]
-    c = c * total_scale
+    c = accumulator.to(tl.float32) * total_scale
 
     if HAS_BIAS:
         bias = tl.load(bias_ptr + offs_bn)
@@ -1463,7 +1467,7 @@ def int8_linear_per_channel(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
+    out_dtype: torch.dtype = None,
 ) -> torch.Tensor:
     """W8A8 linear with per-channel (per-row) weight scales.
 
@@ -1480,11 +1484,14 @@ def int8_linear_per_channel(
         weight: INT8 weight tensor [N, K].
         weight_scale: Per-channel weight scales, shape [N] or [N, 1].
         bias: Optional bias [N].
-        out_dtype: Output dtype (default bfloat16).
+        out_dtype: Output dtype (default to input dtype).
 
     Returns:
         Result tensor [..., N].
     """
+    if out_dtype is None:
+        out_dtype = x.dtype
+    
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
     M, K = x_2d.shape
@@ -1492,9 +1499,12 @@ def int8_linear_per_channel(
 
     x_int8, x_scale = _triton_quantize_rowwise(x_2d)
     # x_scale is [M, 1]; kernel expects flat [M]
-    x_scale_flat = x_scale.reshape(M)
+    x_scale_flat = x_scale.flatten()
 
-    ws = weight_scale.reshape(N).contiguous()
+    if weight_scale.numel() == 1:
+        ws = weight_scale.expand(N).contiguous()
+    else:
+        ws = weight_scale.flatten().contiguous()
 
     output = torch.empty((M, N), device=x.device, dtype=out_dtype)
 

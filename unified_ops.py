@@ -35,8 +35,13 @@ try:
 
     _HAS_TENSORWISE_INT8_LAYOUT = True
 except ImportError:
-    _HAS_TENSORWISE_INT8_LAYOUT = False
-    logging.warning("INT8 tensorwise layout not available from comfy_kitchen")
+    try:
+        from .quant_layouts.tensorwise_int8_layout import TensorWiseINT8Layout
+
+        _HAS_TENSORWISE_INT8_LAYOUT = True
+    except (ImportError, SyntaxError, NameError) as e:
+        _HAS_TENSORWISE_INT8_LAYOUT = False
+        logging.warning(f"INT8 tensorwise layout not available (neither comfy_kitchen nor fallback). Error: {e}")
 
 
 class UnifiedQuantOps:
@@ -66,46 +71,40 @@ class UnifiedQuantOps:
             unexpected_keys,
             error_msgs,
         ):
+            global _HAS_TENSORWISE_INT8_LAYOUT
             weight_key = prefix + "weight"
-
-            # 1. Safely pop all possible scale keys
-            scale_weight_key_old = prefix + "scale_weight"
-            scale_weight_key_new = prefix + "weight_scale"
-
-            scale = state_dict.pop(scale_weight_key_old, None)
-            if scale is None:
-                scale = state_dict.pop(scale_weight_key_new, None)
-
-            scale_2 = state_dict.pop(prefix + "weight_scale_2", None)
-            scalar = state_dict.pop(prefix + "weight_scalar", None)
-
-            # Clean up other scales not used for weight
-            state_dict.pop(prefix + "input_scale", None)
-            state_dict.pop(prefix + "scale_input", None)
-
-            # 2. Parse comfy_quant metadata
-            comfy_quant_tensor = state_dict.pop(prefix + "comfy_quant", None)
-            layer_conf = {}
-
-            if comfy_quant_tensor is not None:
-                try:
-                    cq_str = (
-                        comfy_quant_tensor.numpy().tobytes().decode("utf-8").strip()
-                    )
-                    if cq_str.startswith("{{") and cq_str.endswith("}}"):
-                        cq_str = cq_str[1:-1]
-                    layer_conf = json.loads(cq_str)
-                except Exception as e:
-                    # Fallback to tensor_to_dict
-                    layer_conf = tensor_to_dict(comfy_quant_tensor)
-
-            self.quant_format = layer_conf.get("format", None)
-            self.block_size = layer_conf.get("group_size", None)
-
-            # 3. Load weight and initialize QuantizedTensor based on dtype
             weight_tensor = state_dict.pop(weight_key, None)
 
             if weight_tensor is not None:
+                # Common tensors
+                scale_key = prefix + "weight_scale"
+                scale = state_dict.pop(scale_key, None)
+                if scale is None:
+                    scale = state_dict.pop(prefix + "scale", None)
+
+                scale_2_key = prefix + "weight_scale_2"
+                scale_2 = state_dict.pop(scale_2_key, None)
+
+                block_size_key = prefix + "block_size"
+                if block_size_key in state_dict:
+                    self.block_size = int(state_dict.pop(block_size_key))
+
+                # Handle metadata
+                layer_conf = None
+                if local_metadata and "comfy_quant" in local_metadata:
+                    try:
+                        cq = local_metadata["comfy_quant"]
+                        if isinstance(cq, str):
+                            cq = json.loads(cq)
+                        layer_conf = cq.get(weight_key)
+                    except Exception:
+                        pass
+
+                if layer_conf:
+                    self.quant_format = layer_conf.get("format")
+                    if "block_size" in layer_conf:
+                        self.block_size = layer_conf["block_size"]
+
                 is_nvfp4 = self.quant_format == "nvfp4" or (
                     weight_tensor.dtype == torch.uint8 and scale_2 is not None
                 )
@@ -192,10 +191,16 @@ class UnifiedQuantOps:
                             is_weight=True,
                         )
                         try:
+                            # Re-check layout availability if it failed earlier
+                            from .quant_layouts.tensorwise_int8_layout import TensorWiseINT8Layout
+                            _HAS_TENSORWISE_INT8_LAYOUT = True
+                            
                             import dataclasses
                             field_names = {f.name for f in dataclasses.fields(TensorWiseINT8Layout.Params)}
                             if "per_channel" in field_names and is_per_channel:
                                 params_kwargs["per_channel"] = True
+                            if "weight_scale" in field_names and "scale" in params_kwargs:
+                                params_kwargs["weight_scale"] = params_kwargs.pop("scale")
                         except Exception:
                             pass
                         layout_params = TensorWiseINT8Layout.Params(**params_kwargs)
@@ -292,6 +297,8 @@ class UnifiedQuantOps:
 
                         if scale is not None and scale.dtype == torch.uint8:
                             scale = scale.view(torch.float8_e8m0fnu)
+
+                        scalar = state_dict.pop(prefix + "scalar", None)
 
                         if self.layout_type == "HybridMXFP8Layout":
                             from comfy_kitchen.tensor import HybridMXFP8Layout
