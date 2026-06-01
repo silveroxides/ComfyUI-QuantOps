@@ -47,16 +47,20 @@ def _setup_comfy_kitchen_backends():
         _CK_TRITON_AVAILABLE = False
         return
 
-    # Step 1: Re-enable triton backend (ComfyUI disables it)
+    # Step 1: Check for int8_linear to determine if triton backend is available
     try:
-        ck.enable_backend("triton")
-
         backends = ck.list_backends()
         triton_info = backends.get("triton", {})
 
         if triton_info.get("available") and not triton_info.get("disabled"):
-            _CK_TRITON_AVAILABLE = True
-            logging.info("ComfyUI-QuantOps: Enabled comfy-kitchen triton backend")
+            capabilities = triton_info.get("capabilities", {})
+            if "int8_linear" in capabilities:
+                assert hasattr(ck, "int8_linear") and ck.int8_linear is not None, "comfy-kitchen triton backend reports int8_linear capability, but ck.int8_linear is missing"
+                _CK_TRITON_AVAILABLE = True
+                logging.info("ComfyUI-QuantOps: Enabled comfy-kitchen triton backend with int8_linear support")
+            else:
+                logging.info("ComfyUI-QuantOps: comfy-kitchen triton available, but lacks int8_linear capability")
+                _CK_TRITON_AVAILABLE = False
         else:
             unavail_reason = triton_info.get("unavailable_reason", "unknown")
             logging.info(f"ComfyUI-QuantOps: comfy-kitchen triton unavailable: {unavail_reason}")
