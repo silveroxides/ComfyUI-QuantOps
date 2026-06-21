@@ -520,7 +520,8 @@ class QuantizedCLIPLoader:
         "cogvideox",
         "lens",
         "pixeldit",
-        "ideogram4"
+        "ideogram4",
+        "boogu"
     ]
 
     @classmethod
