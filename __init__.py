@@ -199,6 +199,14 @@ _setup_comfy_kitchen_backends()
 # Register layouts
 _register_layouts()
 
+# Patch stock ComfyUI loaders so QuantOps-only metadata works from normal loaders.
+try:
+    from .auto_patch import install_auto_patch
+
+    install_auto_patch()
+except Exception as e:
+    logging.warning(f"ComfyUI-QuantOps: failed to install stock-loader auto patch: {e}")
+
 # Import nodes for ComfyUI discovery
 from .nodes.loader_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 

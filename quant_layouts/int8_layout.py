@@ -281,7 +281,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                 M // block_size, block_size, N // block_size, block_size
             )
             qdata_blocked = qdata_blocked.permute(0, 2, 1, 3)
-            scale_broadcast = scale.unsqueeze(-1).unsqueeze(-1)
+            scale_broadcast = scale.to(dtype=output_dt, device=qdata_blocked.device).unsqueeze(-1).unsqueeze(-1)
             dequant = qdata_blocked.to(output_dt) * scale_broadcast
             dequant = dequant.permute(0, 2, 1, 3).reshape(M, N)
         else:
@@ -312,7 +312,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                         f"Activation scale shape mismatch: scale.shape={scale.shape}, expected {expected_scale_shape}"
                     )
             qdata_blocked = qdata.reshape(*batch_shape, K // block_size, block_size)
-            scale_broadcast = scale.unsqueeze(-1)
+            scale_broadcast = scale.to(dtype=output_dt, device=qdata_blocked.device).unsqueeze(-1)
             dequant = qdata_blocked.to(output_dt) * scale_broadcast
             dequant = dequant.reshape(qdata.shape)
 
@@ -589,7 +589,7 @@ def int8_mm(func, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    return func(input_tensor, weight)
+    return torch.mm(input_tensor, weight)
 
 
 @register_layout_op(torch.ops.aten.addmm.default, BlockWiseINT8Layout)
@@ -606,7 +606,7 @@ def int8_addmm(func, args, kwargs):
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
 
-    return func(bias, input_tensor, weight, **kwargs)
+    return torch.addmm(bias, input_tensor, weight, **kwargs)
 
 
 @register_layout_op(torch.ops.aten.view.default, BlockWiseINT8Layout)
@@ -615,10 +615,12 @@ def int8_func(func, args, kwargs):
     """Handle view/transpose for INT8 tensors."""
     input_tensor = args[0]
     if isinstance(input_tensor, QuantizedTensor):
-        qdata = input_tensor._qdata
-        ar = list(args)
-        ar[0] = qdata
-        new_qdata = func(*ar, **kwargs)
-        # Use _copy_with to preserve params
-        return input_tensor._copy_with(qdata=new_qdata)
-    return func(*args, **kwargs)
+        plain_input = input_tensor.dequantize()
+        if len(args) == 1:
+            return torch.t(plain_input)
+        shape = args[1] if len(args) == 2 and isinstance(args[1], (tuple, list)) else args[1:]
+        return plain_input.view(*shape)
+    if len(args) == 1:
+        return torch.t(input_tensor)
+    shape = args[1] if len(args) == 2 and isinstance(args[1], (tuple, list)) else args[1:]
+    return input_tensor.view(*shape)

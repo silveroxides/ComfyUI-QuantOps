@@ -330,7 +330,7 @@ def rowwise_fp8_mm(func, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    return func(input_tensor, weight)
+    return torch.mm(input_tensor, weight)
 
 
 @register_layout_op(torch.ops.aten.addmm.default, RowWiseFP8Layout)
@@ -347,7 +347,7 @@ def rowwise_fp8_addmm(func, args, kwargs):
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
 
-    return func(bias, input_tensor, weight, **kwargs)
+    return torch.addmm(bias, input_tensor, weight, **kwargs)
 
 
 @register_layout_op(torch.ops.aten.view.default, RowWiseFP8Layout)
@@ -356,12 +356,15 @@ def rowwise_fp8_func(func, args, kwargs):
     """Handle view/transpose for row-wise FP8 tensors."""
     input_tensor = args[0]
     if isinstance(input_tensor, QuantizedTensor):
-        plain_input, scale = RowWiseFP8Layout.get_plain_tensors(input_tensor)
-        ar = list(args)
-        ar[0] = plain_input
-        # Use _copy_with to preserve params
-        return input_tensor._copy_with(qdata=func(*ar, **kwargs))
-    return func(*args, **kwargs)
+        plain_input = input_tensor.dequantize()
+        if len(args) == 1:
+            return torch.t(plain_input)
+        shape = args[1] if len(args) == 2 and isinstance(args[1], (tuple, list)) else args[1:]
+        return plain_input.view(*shape)
+    if len(args) == 1:
+        return torch.t(input_tensor)
+    shape = args[1] if len(args) == 2 and isinstance(args[1], (tuple, list)) else args[1:]
+    return input_tensor.view(*shape)
 
 
 @register_layout_op(torch.ops.aten.linear.default, BlockWiseFP8Layout)
@@ -473,7 +476,7 @@ def blockwise_fp8_mm(func, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    return func(input_tensor, weight)
+    return torch.mm(input_tensor, weight)
 
 
 @register_layout_op(torch.ops.aten.addmm.default, BlockWiseFP8Layout)
@@ -490,7 +493,7 @@ def blockwise_fp8_addmm(func, args, kwargs):
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
 
-    return func(bias, input_tensor, weight, **kwargs)
+    return torch.addmm(bias, input_tensor, weight, **kwargs)
 
 
 @register_layout_op(torch.ops.aten.view.default, BlockWiseFP8Layout)
@@ -499,11 +502,12 @@ def blockwise_fp8_func(func, args, kwargs):
     """Handle view/transpose for block-wise FP8 tensors."""
     input_tensor = args[0]
     if isinstance(input_tensor, QuantizedTensor):
-        plain_input, scale, block_size = BlockWiseFP8Layout.get_plain_tensors(
-            input_tensor
-        )
-        ar = list(args)
-        ar[0] = plain_input
-        # Use _copy_with to preserve params
-        return input_tensor._copy_with(qdata=func(*ar, **kwargs))
-    return func(*args, **kwargs)
+        plain_input = input_tensor.dequantize()
+        if len(args) == 1:
+            return torch.t(plain_input)
+        shape = args[1] if len(args) == 2 and isinstance(args[1], (tuple, list)) else args[1:]
+        return plain_input.view(*shape)
+    if len(args) == 1:
+        return torch.t(input_tensor)
+    shape = args[1] if len(args) == 2 and isinstance(args[1], (tuple, list)) else args[1:]
+    return input_tensor.view(*shape)

@@ -247,6 +247,20 @@ class UnifiedQuantOps:
                         )
                         if self.block_size is None:
                             self.block_size = qconfig.get("group_size", None)
+                        if self.layout_type in [
+                            "TensorCoreFP8Layout",
+                            "TensorCoreFP8E4M3Layout",
+                            "TensorCoreFP8E5M2Layout",
+                        ] and scale is not None:
+                            if scale.ndim == 1 and scale.numel() == weight_tensor.shape[0]:
+                                self.layout_type = "RowWiseFP8Layout"
+                            elif scale.ndim == 2 and scale.numel() > 1:
+                                self.layout_type = "BlockWiseFP8Layout"
+                                if self.block_size is None:
+                                    M, N = weight_tensor.shape
+                                    scale_M, scale_N = scale.shape
+                                    if M % scale_M == 0 and N % scale_N == 0:
+                                        self.block_size = M // scale_M
                     else:
                         if scale is not None:
                             if scale.ndim == 0 or (
