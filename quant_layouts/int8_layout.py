@@ -258,6 +258,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
             if BlockWiseINT8Layout.use_triton and qdata.dim() == 2 and qdata.is_cuda:
                 try:
                     weight_dequant = _get_triton_function("weight_dequant")
+                    _log_int8_path("TRITON_WEIGHT_DEQUANT", qdata.shape, None)
                     return weight_dequant(
                         qdata, scale, block_size=block_size, output_dtype=output_dt
                     )
@@ -277,6 +278,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                     raise RuntimeError(
                         f"Weight scale shape mismatch: scale.shape={scale.shape}, expected {expected_scale_shape}"
                     )
+            _log_int8_path("PYTORCH_WEIGHT_DEQUANT", qdata.shape, None)
             qdata_blocked = qdata.reshape(
                 M // block_size, block_size, N // block_size, block_size
             )
@@ -289,6 +291,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
             if BlockWiseINT8Layout.use_triton and qdata.is_cuda:
                 try:
                     act_dequant = _get_triton_function("act_dequant")
+                    _log_int8_path("TRITON_ACT_DEQUANT", qdata.shape, None)
                     return act_dequant(
                         qdata, scale, block_size=block_size, output_dtype=output_dt
                     )
@@ -311,6 +314,7 @@ class BlockWiseINT8Layout(QuantizedLayout):
                     raise RuntimeError(
                         f"Activation scale shape mismatch: scale.shape={scale.shape}, expected {expected_scale_shape}"
                     )
+            _log_int8_path("PYTORCH_ACT_DEQUANT", qdata.shape, None)
             qdata_blocked = qdata.reshape(*batch_shape, K // block_size, block_size)
             scale_broadcast = scale.to(dtype=output_dt, device=qdata_blocked.device).unsqueeze(-1)
             dequant = qdata_blocked.to(output_dt) * scale_broadcast
@@ -334,7 +338,17 @@ class BlockWiseINT8Layout(QuantizedLayout):
 # ==============================================================================
 
 # Call counters to avoid log spam
-_int8_path_counts = {"NATIVE_TRITON": 0, "PYTORCH_BOTH_QUANT": 0, "DEQUANT_FALLBACK": 0, "DYNAMIC_ACT_QUANT": 0}
+_int8_path_counts = {
+    "NATIVE_TRITON": 0,
+    "PYTORCH_BOTH_QUANT": 0,
+    "PYTORCH_DYNAMIC_FALLBACK": 0,
+    "PYTORCH_WEIGHT_DEQUANT": 0,
+    "PYTORCH_ACT_DEQUANT": 0,
+    "TRITON_WEIGHT_DEQUANT": 0,
+    "TRITON_ACT_DEQUANT": 0,
+    "DEQUANT_FALLBACK": 0,
+    "DYNAMIC_ACT_QUANT": 0,
+}
 _LOG_LIMIT = 3  # Log first N occurrences per path, then summary
 
 
@@ -348,24 +362,44 @@ def _log_int8_path(path_type, input_shape, weight_shape, reason=None):
     if count < _LOG_LIMIT:
         if path_type == "NATIVE_TRITON":
             logging.info(
-                f"INT8: Native Triton matmul - input={input_shape}, weight={weight_shape}"
+                f"ComfyUI-QuantOps INT8 blockwise: backend=triton used native Triton matmul - input={input_shape}, weight={weight_shape}"
             )
         elif path_type == "PYTORCH_BOTH_QUANT":
             logging.info(
-                f"INT8: PyTorch fallback (both quantized) - input={input_shape}, weight={weight_shape}"
+                f"ComfyUI-QuantOps INT8 blockwise: backend=pytorch fallback used dequantized linear (both quantized) - input={input_shape}, weight={weight_shape}"
+            )
+        elif path_type == "PYTORCH_DYNAMIC_FALLBACK":
+            logging.info(
+                f"ComfyUI-QuantOps INT8 blockwise: backend=pytorch fallback used dequantized linear after dynamic activation quant - input={input_shape}, weight={weight_shape}"
+            )
+        elif path_type == "PYTORCH_WEIGHT_DEQUANT":
+            logging.info(
+                f"ComfyUI-QuantOps INT8 blockwise: backend=pytorch fallback dequantized weight for generic torch op - qdata={input_shape}. Native INT8 matmul was not used for this op."
+            )
+        elif path_type == "PYTORCH_ACT_DEQUANT":
+            logging.info(
+                f"ComfyUI-QuantOps INT8 blockwise: backend=pytorch fallback dequantized activation for generic torch op - qdata={input_shape}. Native INT8 matmul was not used for this op."
+            )
+        elif path_type == "TRITON_WEIGHT_DEQUANT":
+            logging.info(
+                f"ComfyUI-QuantOps INT8 blockwise: backend=triton dequantized weight for generic torch op - qdata={input_shape}. Native INT8 matmul was not used for this op."
+            )
+        elif path_type == "TRITON_ACT_DEQUANT":
+            logging.info(
+                f"ComfyUI-QuantOps INT8 blockwise: backend=triton dequantized activation for generic torch op - qdata={input_shape}. Native INT8 matmul was not used for this op."
             )
         elif path_type == "DYNAMIC_ACT_QUANT":
             logging.info(
-                f"INT8: Dynamic activation quant - input={input_shape}, weight={weight_shape}"
+                f"ComfyUI-QuantOps INT8 blockwise: dynamically quantized activation - input={input_shape}, weight={weight_shape}"
             )
         elif path_type == "DEQUANT_FALLBACK":
             logging.warning(
-                f"INT8: Dequant fallback ({reason}) - input={input_shape}, weight={weight_shape}. "
+                f"ComfyUI-QuantOps INT8 blockwise: dequant fallback ({reason}) - input={input_shape}, weight={weight_shape}. "
                 f"Native INT8 matmul NOT used - only memory savings, no compute speedup."
             )
     elif count == _LOG_LIMIT:
         logging.info(
-            f"INT8: Suppressing further '{path_type}' logs (limit={_LOG_LIMIT})"
+            f"ComfyUI-QuantOps INT8 blockwise: suppressing further '{path_type}' logs (limit={_LOG_LIMIT})"
         )
 
 
@@ -544,6 +578,7 @@ def int8_linear(func, args, kwargs):
                 if result.dtype != out_dtype:
                     result = result.to(out_dtype)
 
+                _log_int8_path("NATIVE_TRITON", a_int8.shape, b_int8.shape)
                 return result.reshape(*orig_shape[:-1], weight.shape[0])
             except Exception as e:
                 logging.warning(
@@ -551,6 +586,7 @@ def int8_linear(func, args, kwargs):
                 )
         
         # PyTorch fallback for dynamic quant path
+        _log_int8_path("PYTORCH_DYNAMIC_FALLBACK", a_int8.shape, b_int8.shape)
         output = _int8_gemm_pytorch_fallback(
             a_int8, a_scale, b_int8, b_scale, b_block_size, bias
         )

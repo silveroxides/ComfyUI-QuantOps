@@ -18,6 +18,7 @@ import torch
 NATIVE_COMFY_FORMATS = {
     "float8_e4m3fn",
     "float8_e5m2",
+    "int8_tensorwise",
     "mxfp8",
     "nvfp4",
 }
@@ -33,6 +34,24 @@ def _metadata_formats(quant_metadata: Optional[dict]) -> set[str]:
 def _needs_quantops(quant_metadata: Optional[dict]) -> bool:
     formats = _metadata_formats(quant_metadata)
     return bool(formats - NATIVE_COMFY_FORMATS)
+
+
+def _format_names(formats: Iterable[str]) -> str:
+    return ", ".join(sorted(formats)) if formats else "none"
+
+
+def _backend_details(formats: Iterable[str]) -> str:
+    details = []
+    formats = set(formats)
+    if formats & {"int8", "int8_blockwise"}:
+        try:
+            from .quant_layouts.int8_layout import BlockWiseINT8Layout
+
+            backend = "triton" if BlockWiseINT8Layout.use_triton else "pytorch fallback"
+        except Exception:
+            backend = "unknown"
+        details.append(f"blockwise INT8 backend={backend}")
+    return "; ".join(details)
 
 
 def _prepare_quantops_options(
@@ -52,6 +71,12 @@ def _prepare_quantops_options(
     )
 
     if not _needs_quantops(quant_metadata):
+        formats = _metadata_formats(quant_metadata)
+        if formats:
+            logging.info(
+                "ComfyUI-QuantOps: not used for stock loader; native ComfyUI handles formats: %s",
+                _format_names(formats),
+            )
         return state_dict, metadata, dict(model_options or {}), quant_metadata, False
 
     from .unified_ops import make_quant_ops
@@ -62,9 +87,11 @@ def _prepare_quantops_options(
     patched_options.setdefault("quantization_metadata", {"mixed_ops": True})
 
     formats = sorted(_metadata_formats(quant_metadata) - NATIVE_COMFY_FORMATS)
+    details = _backend_details(formats)
     logging.info(
-        "ComfyUI-QuantOps: auto-injected custom operations for stock loader formats: %s",
-        ", ".join(formats),
+        "ComfyUI-QuantOps: used for stock loader; custom operations active for formats: %s%s",
+        _format_names(formats),
+        f" ({details})" if details else "",
     )
     return state_dict, metadata, patched_options, quant_metadata, True
 

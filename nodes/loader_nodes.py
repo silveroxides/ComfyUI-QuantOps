@@ -19,6 +19,8 @@ import comfy.supported_models_base
 import comfy.latent_formats
 import comfy.conds
 
+from ..auto_patch import NATIVE_COMFY_FORMATS
+
 # Try to import UnifiedSafetensorsLoader for aimdo-free loading
 try:
     from unifiedefficientloader import UnifiedSafetensorsLoader
@@ -206,6 +208,45 @@ def _configure_int8_backend(kernel_backend):
         logging.warning(f"Failed to configure comfy_kitchen backend: {e}")
 
 
+def _quant_metadata_formats(quant_metadata):
+    if not quant_metadata:
+        return set()
+    return {
+        conf.get("format")
+        for conf in quant_metadata.get("layers", {}).values()
+        if conf.get("format")
+    }
+
+
+def _selected_formats(quant_metadata, quant_format):
+    formats = _quant_metadata_formats(quant_metadata)
+    if not formats and quant_format != "auto":
+        formats = {quant_format}
+    return formats
+
+
+def _format_names(formats):
+    return ", ".join(sorted(formats)) if formats else "none"
+
+
+def _backend_details(formats):
+    details = []
+    if formats & {"int8", "int8_blockwise"}:
+        try:
+            from ..quant_layouts.int8_layout import BlockWiseINT8Layout
+
+            backend = "triton" if BlockWiseINT8Layout.use_triton else "pytorch fallback"
+        except Exception:
+            backend = "unknown"
+        details.append(f"blockwise INT8 backend={backend}")
+    return "; ".join(details)
+
+
+def _quantops_only_formats(quant_metadata, quant_format):
+    formats = _selected_formats(quant_metadata, quant_format)
+    return {fmt for fmt in formats if fmt not in NATIVE_COMFY_FORMATS}
+
+
 def _build_model_options(
     quant_format,
     sd,
@@ -250,7 +291,7 @@ def _build_model_options(
                 for conf in quant_metadata.get("layers", {}).values()
                 if conf.get("format")
             }
-            has_int8 = any(fmt in ("int8", "int8_tensorwise") for fmt in layer_formats)
+            has_int8 = any(fmt in ("int8", "int8_blockwise") for fmt in layer_formats)
         else:
             has_int8 = any(
                 k.endswith(".weight") and sd[k].dtype == torch.int8
@@ -259,7 +300,7 @@ def _build_model_options(
             )
         if has_int8:
             _configure_int8_backend(kernel_backend)
-    elif quant_format in ("int8", "int8_tensorwise"):
+    elif quant_format in ("int8", "int8_blockwise"):
         _configure_int8_backend(kernel_backend)
 
     # Forward text-encoder quantization metadata into model_options
@@ -280,14 +321,28 @@ def _build_model_options(
     if quant_metadata is not None and "quantization_metadata" not in model_options:
         model_options["quantization_metadata"] = {"mixed_ops": True}
 
-    # Attach unified custom operations dynamically
-    try:
-        from ..unified_ops import make_quant_ops
+    quantops_formats = _quantops_only_formats(quant_metadata, quant_format)
+    if quantops_formats:
+        try:
+            from ..unified_ops import make_quant_ops
 
-        base_ops = model_options.get("custom_operations", None)
-        model_options["custom_operations"] = make_quant_ops(base_ops)
-    except ImportError as e:
-        logging.warning(f"unified_ops not available: {e}")
+            base_ops = model_options.get("custom_operations", None)
+            model_options["custom_operations"] = make_quant_ops(base_ops)
+            details = _backend_details(quantops_formats)
+            logging.info(
+                "ComfyUI-QuantOps: used by QuantOps loader; custom operations active for formats: %s%s",
+                _format_names(quantops_formats),
+                f" ({details})" if details else "",
+            )
+        except ImportError as e:
+            logging.warning(f"unified_ops not available: {e}")
+    else:
+        formats = _selected_formats(quant_metadata, quant_format)
+        if formats:
+            logging.info(
+                "ComfyUI-QuantOps: not used by QuantOps loader; native ComfyUI handles formats: %s",
+                _format_names(formats),
+            )
 
     return model_options
 
