@@ -224,6 +224,14 @@ try:
 except Exception as e:
     logging.warning(f"ComfyUI-QuantOps: failed to install stock-loader auto patch: {e}")
 
+# Extend an installed GGUF provider without replacing its loader implementation.
+try:
+    from .gguf_integration import install_gguf_integration
+
+    install_gguf_integration()
+except Exception as e:
+    logging.warning(f"ComfyUI-QuantOps: failed to install GGUF integration: {e}")
+
 # Import nodes for ComfyUI discovery
 from .nodes.loader_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 

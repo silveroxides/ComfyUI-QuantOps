@@ -263,6 +263,19 @@ _fp8_path_counts = {}
 _FP8_LOG_LIMIT = 3
 
 
+def _disable_fp8_kernels(error):
+    global _HAS_FP8_KERNELS
+
+    _HAS_FP8_KERNELS = False
+    lines = str(error).strip().splitlines()
+    summary = lines[-1] if lines else type(error).__name__
+    logging.warning(
+        "ComfyUI-QuantOps FP8: disabled Triton kernels after %s: %s",
+        type(error).__name__,
+        summary,
+    )
+
+
 def _log_fp8_path(layout, path, input_shape, weight_shape):
     key = (layout, path)
     count = _fp8_path_counts.get(key, 0)
@@ -327,7 +340,7 @@ def rowwise_fp8_linear(func, args, kwargs):
                     _log_fp8_path("rowwise", "triton-dynamic", a_qdata.shape, w_qdata.shape)
                     return result.to(orig_dtype)
                 except Exception as e:
-                    logging.warning(f"FP8 rowwise native kernel failed: {e}")
+                    _disable_fp8_kernels(e)
 
     # Fallback: dequantize
     _log_fp8_path("rowwise", "dequant-fallback", input_tensor.shape, weight.shape)
@@ -431,9 +444,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                     _log_fp8_path("blockwise", "triton-quantized", a_qdata.shape, w_qdata.shape)
                     return result.to(orig_dtype)
                 except Exception as e:
-                    logging.warning(
-                        f"FP8 native kernel failed, falling back to dequant: {e}"
-                    )
+                    _disable_fp8_kernels(e)
 
             # Input is not quantized - quantize it dynamically
             elif input_tensor.dtype in [torch.float16, torch.bfloat16, torch.float32]:
@@ -465,9 +476,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                     _log_fp8_path("blockwise", "triton-dynamic", a_qdata.shape, w_qdata.shape)
                     return result.to(orig_dtype)
                 except Exception as e:
-                    logging.warning(
-                        f"FP8 dynamic quant failed, falling back to dequant: {e}"
-                    )
+                    _disable_fp8_kernels(e)
 
     # Fallback: dequantize
     _log_fp8_path("blockwise", "dequant-fallback", input_tensor.shape, weight.shape)
