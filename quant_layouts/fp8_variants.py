@@ -259,6 +259,30 @@ class BlockWiseFP8Layout(QuantizedLayout):
 # ==============================================================================
 
 
+_fp8_path_counts = {}
+_FP8_LOG_LIMIT = 3
+
+
+def _log_fp8_path(layout, path, input_shape, weight_shape):
+    key = (layout, path)
+    count = _fp8_path_counts.get(key, 0)
+    _fp8_path_counts[key] = count + 1
+    if count < _FP8_LOG_LIMIT:
+        logging.info(
+            "ComfyUI-QuantOps FP8 %s: path=%s input=%s weight=%s",
+            layout,
+            path,
+            input_shape,
+            weight_shape,
+        )
+    elif count == _FP8_LOG_LIMIT:
+        logging.info(
+            "ComfyUI-QuantOps FP8 %s: suppressing further path=%s logs",
+            layout,
+            path,
+        )
+
+
 @register_layout_op(torch.ops.aten.linear.default, RowWiseFP8Layout)
 def rowwise_fp8_linear(func, args, kwargs):
     """Row-wise FP8 linear operation with native kernel support."""
@@ -286,11 +310,6 @@ def rowwise_fp8_linear(func, args, kwargs):
                         dtype=w_qdata.dtype,
                     )
 
-                    logging.debug(
-                        f"FP8 rowwise: Native kernel (dynamic quant), "
-                        f"input={a_qdata.shape}, weight={w_qdata.shape}"
-                    )
-
                     # For rowwise, bias needs manual addition (no fused kernel yet)
                     result = fp8_gemm_rowwise(
                         a_qdata,
@@ -305,12 +324,13 @@ def rowwise_fp8_linear(func, args, kwargs):
                             device=result.device, dtype=result.dtype
                         )
 
+                    _log_fp8_path("rowwise", "triton-dynamic", a_qdata.shape, w_qdata.shape)
                     return result.to(orig_dtype)
                 except Exception as e:
                     logging.warning(f"FP8 rowwise native kernel failed: {e}")
 
     # Fallback: dequantize
-    logging.debug("FP8 rowwise: Using dequant fallback")
+    _log_fp8_path("rowwise", "dequant-fallback", input_tensor.shape, weight.shape)
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
@@ -356,6 +376,8 @@ def rowwise_fp8_func(func, args, kwargs):
     """Handle view/transpose for row-wise FP8 tensors."""
     input_tensor = args[0]
     if isinstance(input_tensor, QuantizedTensor):
+        path = "transpose-dequant" if len(args) == 1 else "view-dequant"
+        _log_fp8_path("rowwise", path, None, input_tensor.shape)
         plain_input = input_tensor.dequantize()
         if len(args) == 1:
             return torch.t(plain_input)
@@ -388,11 +410,6 @@ def blockwise_fp8_linear(func, args, kwargs):
                     input_tensor
                 )
 
-                logging.debug(
-                    f"FP8 blockwise: Native kernel (both quantized), "
-                    f"input={a_qdata.shape}, weight={w_qdata.shape}, block_size={w_block_size}"
-                )
-
                 try:
                     if bias is not None:
                         result = fp8_addmm_blockwise(
@@ -411,6 +428,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                             w_scale,
                             input_block_size=w_block_size,
                         )
+                    _log_fp8_path("blockwise", "triton-quantized", a_qdata.shape, w_qdata.shape)
                     return result.to(orig_dtype)
                 except Exception as e:
                     logging.warning(
@@ -427,11 +445,6 @@ def blockwise_fp8_linear(func, args, kwargs):
                         dtype=w_qdata.dtype,
                     )
 
-                    logging.debug(
-                        f"FP8 blockwise: Native kernel (dynamic quant), "
-                        f"input={a_qdata.shape}, weight={w_qdata.shape}"
-                    )
-
                     if bias is not None:
                         result = fp8_addmm_blockwise(
                             a_qdata,
@@ -449,6 +462,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                             w_scale,
                             input_block_size=w_block_size,
                         )
+                    _log_fp8_path("blockwise", "triton-dynamic", a_qdata.shape, w_qdata.shape)
                     return result.to(orig_dtype)
                 except Exception as e:
                     logging.warning(
@@ -456,7 +470,7 @@ def blockwise_fp8_linear(func, args, kwargs):
                     )
 
     # Fallback: dequantize
-    logging.debug("FP8 blockwise: Using dequant fallback")
+    _log_fp8_path("blockwise", "dequant-fallback", input_tensor.shape, weight.shape)
     if isinstance(weight, QuantizedTensor):
         weight = weight.dequantize()
     if isinstance(input_tensor, QuantizedTensor):
@@ -502,6 +516,8 @@ def blockwise_fp8_func(func, args, kwargs):
     """Handle view/transpose for block-wise FP8 tensors."""
     input_tensor = args[0]
     if isinstance(input_tensor, QuantizedTensor):
+        path = "transpose-dequant" if len(args) == 1 else "view-dequant"
+        _log_fp8_path("blockwise", path, None, input_tensor.shape)
         plain_input = input_tensor.dequantize()
         if len(args) == 1:
             return torch.t(plain_input)

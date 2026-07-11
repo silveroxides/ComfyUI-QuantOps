@@ -11,6 +11,12 @@ All layouts are lazy-loaded to avoid import errors when optional dependencies
 
 import logging
 
+import torch
+from comfy.quant_ops import QUANT_ALGOS, register_layout_class
+
+
+_NATIVE_COMFY_FORMATS = frozenset(QUANT_ALGOS)
+
 # =============================================================================
 # Module-level state for comfy-kitchen backend integration
 # =============================================================================
@@ -72,18 +78,22 @@ def _setup_comfy_kitchen_backends():
 def _register_layouts():
     """Register our custom layouts into ComfyUI's layout registry and QUANT_ALGOS dict."""
     try:
-        from comfy.quant_ops import QUANT_ALGOS, register_layout_class
-        import torch
+        registered = []
+        if "int8_blockwise" not in QUANT_ALGOS:
+            from .quant_layouts.int8_layout import BlockWiseINT8Layout
 
-        # Import our layouts (this also registers their operation handlers)
-        from .quant_layouts.int8_layout import BlockWiseINT8Layout
-        from .quant_layouts.fp8_variants import RowWiseFP8Layout, BlockWiseFP8Layout
+            register_layout_class("BlockWiseINT8Layout", BlockWiseINT8Layout)
+            registered.append("BlockWiseINT8Layout")
+        if "float8_e4m3fn_rowwise" not in QUANT_ALGOS:
+            from .quant_layouts.fp8_variants import RowWiseFP8Layout
 
-        # Register layouts using the new comfy_kitchen API
-        register_layout_class("BlockWiseINT8Layout", BlockWiseINT8Layout)
-        register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
-        register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
-        registered = ["BlockWiseINT8Layout", "RowWiseFP8Layout", "BlockWiseFP8Layout"]
+            register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
+            registered.append("RowWiseFP8Layout")
+        if "float8_e4m3fn_blockwise" not in QUANT_ALGOS:
+            from .quant_layouts.fp8_variants import BlockWiseFP8Layout
+
+            register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
+            registered.append("BlockWiseFP8Layout")
 
         # Tensorwise INT8 is native in current ComfyUI. Only register it on
         # older installs that do not already expose the format.
@@ -151,13 +161,14 @@ def _register_layouts():
         )
 
         # Hybrid MXFP8 from comfy_kitchen
-        try:
-            from comfy_kitchen.tensor import HybridMXFP8Layout
-            register_layout_class("HybridMXFP8Layout", HybridMXFP8Layout)
-            registered.append("HybridMXFP8Layout")
-            logging.info("ComfyUI-QuantOps: Registered HybridMXFP8Layout")
-        except ImportError:
-            logging.debug("ComfyUI-QuantOps: HybridMXFP8Layout not available")
+        if "hybrid_mxfp8" not in QUANT_ALGOS:
+            try:
+                from comfy_kitchen.tensor import HybridMXFP8Layout
+                register_layout_class("HybridMXFP8Layout", HybridMXFP8Layout)
+                registered.append("HybridMXFP8Layout")
+                logging.info("ComfyUI-QuantOps: Registered HybridMXFP8Layout")
+            except ImportError:
+                logging.debug("ComfyUI-QuantOps: HybridMXFP8Layout not available")
 
         QUANT_ALGOS.setdefault(
             "hybrid_mxfp8",
@@ -193,15 +204,23 @@ def _register_layouts():
 
 # Setup backends first (enables ck triton, registers our kernels)
 _setup_comfy_kitchen_backends()
+logging.info(
+    "ComfyUI-QuantOps diagnostic: native formats before extension: %s",
+    ", ".join(sorted(_NATIVE_COMFY_FORMATS)),
+)
 
 # Register layouts
 _register_layouts()
+logging.info(
+    "ComfyUI-QuantOps diagnostic: formats added to registry: %s",
+    ", ".join(sorted(set(QUANT_ALGOS) - _NATIVE_COMFY_FORMATS)) or "none",
+)
 
 # Patch stock ComfyUI loaders so QuantOps-only metadata works from normal loaders.
 try:
     from .auto_patch import install_auto_patch
 
-    install_auto_patch()
+    install_auto_patch(_NATIVE_COMFY_FORMATS)
 except Exception as e:
     logging.warning(f"ComfyUI-QuantOps: failed to install stock-loader auto patch: {e}")
 

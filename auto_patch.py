@@ -16,10 +16,22 @@ import torch
 
 
 NATIVE_COMFY_FORMATS = {
+    "convrot_w4a4",
     "float8_e4m3fn",
     "float8_e5m2",
     "int8_tensorwise",
     "mxfp8",
+    "nvfp4",
+}
+
+QUANTOPS_FORMATS = {
+    "int8",
+    "int8_blockwise",
+    "int8_tensorwise",
+    "float8_e4m3fn_rowwise",
+    "float8_e4m3fn_blockwise",
+    "mxfp8",
+    "hybrid_mxfp8",
     "nvfp4",
 }
 
@@ -31,9 +43,29 @@ def _metadata_formats(quant_metadata: Optional[dict]) -> set[str]:
     return {conf.get("format") for conf in layers.values() if conf.get("format")}
 
 
-def _needs_quantops(quant_metadata: Optional[dict]) -> bool:
+def _format_summary(quant_metadata: Optional[dict]) -> tuple[int, str]:
+    counts = {}
+    if quant_metadata:
+        for conf in quant_metadata.get("layers", {}).values():
+            quant_format = conf.get("format")
+            if quant_format:
+                counts[quant_format] = counts.get(quant_format, 0) + 1
+    summary = ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+    return sum(counts.values()), summary or "none"
+
+
+def _quantops_formats(
+    quant_metadata: Optional[dict], native_formats: Iterable[str]
+) -> set[str]:
     formats = _metadata_formats(quant_metadata)
-    return bool(formats - NATIVE_COMFY_FORMATS)
+    return (formats & QUANTOPS_FORMATS) - set(native_formats)
+
+
+def _needs_quantops(
+    quant_metadata: Optional[dict],
+    native_formats: Iterable[str] = NATIVE_COMFY_FORMATS,
+) -> bool:
+    return bool(_quantops_formats(quant_metadata, native_formats))
 
 
 def _format_names(formats: Iterable[str]) -> str:
@@ -59,24 +91,57 @@ def _prepare_quantops_options(
     metadata: Optional[dict],
     model_options: Optional[dict],
     model_prefix: str = "",
+    native_formats: Iterable[str] = NATIVE_COMFY_FORMATS,
+    loader_name: str = "stock",
 ) -> Tuple[dict, dict, dict, Optional[dict], bool]:
     """Inject .comfy_quant tensors and QuantOps custom_operations if needed."""
     from .utils.safetensors_loader import convert_old_quants
 
     metadata = dict(metadata or {})
+    input_key_count = len(state_dict)
+    if "_quantization_metadata" in metadata:
+        metadata_source = "file-metadata"
+    elif f"{model_prefix}scaled_fp8" in state_dict:
+        metadata_source = "legacy-scaled-fp8"
+    elif any(key.endswith(".comfy_quant") for key in state_dict):
+        metadata_source = "comfy-quant-tensors"
+    else:
+        metadata_source = "dtype-scale-inference"
     state_dict, metadata, quant_metadata = convert_old_quants(
         state_dict,
         model_prefix=model_prefix,
         metadata=metadata,
     )
+    if not quant_metadata:
+        metadata_source = "none"
 
-    if not _needs_quantops(quant_metadata):
-        formats = _metadata_formats(quant_metadata)
-        if formats:
-            logging.info(
-                "ComfyUI-QuantOps: not used for stock loader; native ComfyUI handles formats: %s",
-                _format_names(formats),
-            )
+    quantops_formats = _quantops_formats(quant_metadata, native_formats)
+    formats = _metadata_formats(quant_metadata)
+    native = formats & set(native_formats)
+    quant_layers, format_summary = _format_summary(quant_metadata)
+    existing_custom_ops = bool(model_options and model_options.get("custom_operations") is not None)
+    dtype_override = (model_options or {}).get("dtype", "default")
+    fp8_optimizations = bool(model_options and model_options.get("fp8_optimizations", False))
+    if not quantops_formats:
+        if not formats:
+            decision = "no-quantization"
+        elif formats <= set(native_formats):
+            decision = "native-bypass"
+        else:
+            decision = "core-pass-through"
+        logging.info(
+            "ComfyUI-QuantOps diagnostic: loader=%s decision=%s prefix=%s state_keys=%d metadata_source=%s quant_layers=%d formats=%s dtype_override=%s fp8_optimizations=%s existing_custom_operations=%s",
+            loader_name,
+            decision,
+            model_prefix or "<root>",
+            input_key_count,
+            metadata_source,
+            quant_layers,
+            format_summary,
+            dtype_override,
+            fp8_optimizations,
+            existing_custom_ops,
+        )
         return state_dict, metadata, dict(model_options or {}), quant_metadata, False
 
     from .unified_ops import make_quant_ops
@@ -86,12 +151,21 @@ def _prepare_quantops_options(
     patched_options["custom_operations"] = make_quant_ops(base_ops)
     patched_options.setdefault("quantization_metadata", {"mixed_ops": True})
 
-    formats = sorted(_metadata_formats(quant_metadata) - NATIVE_COMFY_FORMATS)
-    details = _backend_details(formats)
+    details = _backend_details(quantops_formats)
     logging.info(
-        "ComfyUI-QuantOps: used for stock loader; custom operations active for formats: %s%s",
-        _format_names(formats),
-        f" ({details})" if details else "",
+        "ComfyUI-QuantOps diagnostic: loader=%s decision=quantops prefix=%s state_keys=%d metadata_source=%s quant_layers=%d formats=%s quantops_formats=%s native_formats=%s dtype_override=%s fp8_optimizations=%s existing_custom_operations=%s backend=%s",
+        loader_name,
+        model_prefix or "<root>",
+        input_key_count,
+        metadata_source,
+        quant_layers,
+        format_summary,
+        _format_names(quantops_formats),
+        _format_names(native),
+        dtype_override,
+        fp8_optimizations,
+        existing_custom_ops,
+        details or "default",
     )
     return state_dict, metadata, patched_options, quant_metadata, True
 
@@ -240,14 +314,16 @@ def _dequantize_for_native_fallback(
     state_dict: dict,
     metadata: Optional[dict],
     quant_metadata: Optional[dict],
+    native_formats: Iterable[str] = NATIVE_COMFY_FORMATS,
 ) -> Tuple[dict, dict, int]:
     fallback_sd = dict(state_dict)
     fallback_metadata = dict(metadata or {})
     quant_metadata = _quant_metadata_from_state_dict(fallback_sd, quant_metadata)
 
+    quantops_formats = _quantops_formats(quant_metadata, native_formats)
     converted = 0
     for layer_name, layer_conf in quant_metadata.get("layers", {}).items():
-        if layer_conf.get("format") in NATIVE_COMFY_FORMATS:
+        if layer_conf.get("format") not in quantops_formats:
             continue
         if _dequantize_layer(fallback_sd, layer_name, layer_conf):
             converted += 1
@@ -268,9 +344,13 @@ def _is_quantops_load_failure(exc: BaseException) -> bool:
     )
 
 
-def install_auto_patch() -> None:
+def install_auto_patch(
+    native_formats: Iterable[str] = NATIVE_COMFY_FORMATS,
+) -> None:
     import comfy.model_detection
     import comfy.sd
+
+    native_formats = frozenset(native_formats)
 
     if getattr(comfy.sd, "_quantops_auto_patch_installed", False):
         return
@@ -288,22 +368,28 @@ def install_auto_patch() -> None:
             dict(sd),
             metadata,
             model_options,
+            native_formats=native_formats,
+            loader_name="diffusion",
         )
         if not did_patch:
-            return original_load_diffusion_model_state_dict(
+            result = original_load_diffusion_model_state_dict(
                 sd,
                 model_options=model_options,
                 metadata=metadata,
                 disable_dynamic=disable_dynamic,
             )
+            logging.info("ComfyUI-QuantOps diagnostic: loader=diffusion path=core result=completed")
+            return result
 
         try:
-            return original_load_diffusion_model_state_dict(
+            result = original_load_diffusion_model_state_dict(
                 dict(prepared_sd),
                 model_options=patched_options,
                 metadata=prepared_metadata,
                 disable_dynamic=disable_dynamic,
             )
+            logging.info("ComfyUI-QuantOps diagnostic: loader=diffusion path=quantops result=completed")
+            return result
         except Exception as exc:
             if not _is_quantops_load_failure(exc):
                 raise
@@ -315,17 +401,23 @@ def install_auto_patch() -> None:
                 prepared_sd,
                 prepared_metadata,
                 quant_metadata,
+                native_formats=native_formats,
             )
             if converted == 0:
                 raise
             fallback_options = dict(model_options or {})
             fallback_options.pop("custom_operations", None)
-            return original_load_diffusion_model_state_dict(
+            result = original_load_diffusion_model_state_dict(
                 fallback_sd,
                 model_options=fallback_options,
                 metadata=fallback_metadata,
                 disable_dynamic=disable_dynamic,
             )
+            logging.info(
+                "ComfyUI-QuantOps diagnostic: loader=diffusion path=bf16-fallback result=completed converted_layers=%d",
+                converted,
+            )
+            return result
 
     def load_state_dict_guess_config_quantops(
         sd,
@@ -345,9 +437,11 @@ def install_auto_patch() -> None:
             metadata,
             model_options,
             model_prefix=diffusion_model_prefix,
+            native_formats=native_formats,
+            loader_name="checkpoint",
         )
         if not did_patch:
-            return original_load_state_dict_guess_config(
+            result = original_load_state_dict_guess_config(
                 sd,
                 output_vae=output_vae,
                 output_clip=output_clip,
@@ -359,9 +453,11 @@ def install_auto_patch() -> None:
                 metadata=metadata,
                 disable_dynamic=disable_dynamic,
             )
+            logging.info("ComfyUI-QuantOps diagnostic: loader=checkpoint path=core result=completed")
+            return result
 
         try:
-            return original_load_state_dict_guess_config(
+            result = original_load_state_dict_guess_config(
                 dict(prepared_sd),
                 output_vae=output_vae,
                 output_clip=output_clip,
@@ -373,6 +469,8 @@ def install_auto_patch() -> None:
                 metadata=prepared_metadata,
                 disable_dynamic=disable_dynamic,
             )
+            logging.info("ComfyUI-QuantOps diagnostic: loader=checkpoint path=quantops result=completed")
+            return result
         except Exception as exc:
             if not _is_quantops_load_failure(exc):
                 raise
@@ -384,12 +482,13 @@ def install_auto_patch() -> None:
                 prepared_sd,
                 prepared_metadata,
                 quant_metadata,
+                native_formats=native_formats,
             )
             if converted == 0:
                 raise
             fallback_options = dict(model_options or {})
             fallback_options.pop("custom_operations", None)
-            return original_load_state_dict_guess_config(
+            result = original_load_state_dict_guess_config(
                 fallback_sd,
                 output_vae=output_vae,
                 output_clip=output_clip,
@@ -401,6 +500,11 @@ def install_auto_patch() -> None:
                 metadata=fallback_metadata,
                 disable_dynamic=disable_dynamic,
             )
+            logging.info(
+                "ComfyUI-QuantOps diagnostic: loader=checkpoint path=bf16-fallback result=completed converted_layers=%d",
+                converted,
+            )
+            return result
 
     comfy.sd.load_diffusion_model_state_dict = load_diffusion_model_state_dict_quantops
     comfy.sd.load_state_dict_guess_config = load_state_dict_guess_config_quantops

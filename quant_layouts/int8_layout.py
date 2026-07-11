@@ -651,6 +651,12 @@ def int8_func(func, args, kwargs):
     """Handle view/transpose for INT8 tensors."""
     input_tensor = args[0]
     if isinstance(input_tensor, QuantizedTensor):
+        path = (
+            "TRITON_WEIGHT_DEQUANT"
+            if BlockWiseINT8Layout.use_triton
+            else "PYTORCH_WEIGHT_DEQUANT"
+        )
+        _log_int8_path(path, input_tensor.shape, None)
         plain_input = input_tensor.dequantize()
         if len(args) == 1:
             return torch.t(plain_input)
