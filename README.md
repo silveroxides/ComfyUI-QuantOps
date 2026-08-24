@@ -1,4 +1,7 @@
-# ComfyUI-QuantOps
+# ComfyUI-QuantOps IS NO LONGER NEEDED SO IT HAS BEEN DEPRECATED
+
+## Support for int8 ConvRot quants is built into ComfyUI now
+
 
 Extended quantization layouts for ComfyUI, enabling loading and inference with models quantized by [convert_to_quant](https://github.com/silveroxides/convert_to_quant).
 
