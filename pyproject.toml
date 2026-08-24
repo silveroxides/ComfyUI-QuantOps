@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI-QuantOps"
-description = "Extended quantization layouts for ComfyUI (INT8, row/block-wise FP8)"
-version = "1.9.7"
+description = "[DEPRECATED] Extended quantization layouts for ComfyUI (INT8, row/block-wise FP8)"
+version = "1.9.8"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.9"
