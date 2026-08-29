@@ -176,9 +176,8 @@ if _HAS_TRITON:
         a_s_ptrs = a_s_ptr + offs_m * a_s_k_blocks
 
         # Weight scale pointers: shape [N//input_block_size, K//input_block_size]
-        # For N tile pid_n, we need scales[pid_n, :] across K iterations
         b_s_k_blocks = tl.cdiv(K, input_block_size)
-        b_s_base = b_s_ptr + pid_n * b_s_k_blocks
+        b_s_rows = offs_n // input_block_size
 
         # Accumulator
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -189,8 +188,8 @@ if _HAS_TRITON:
 
             # Load FP8 tiles and cast to float32
             mask_k = offs_k < K - k_start
-            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0)
-            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0)
+            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
 
             # Cast to float32 for computation
             a_f32 = a_fp8.to(tl.float32)
@@ -205,10 +204,10 @@ if _HAS_TRITON:
 
             # Load scales
             a_s = tl.load(a_s_ptrs + k_scale_idx)  # [BLOCK_SIZE_M]
-            b_s = tl.load(b_s_base + k_scale_idx)  # scalar (for this N tile, K block)
+            b_s = tl.load(b_s_ptr + b_s_rows * b_s_k_blocks + k_scale_idx)
 
             # Apply scales: result = dot * a_scale[:, None] * b_scale
-            accumulator += dot_result * a_s[:, None] * b_s
+            accumulator += dot_result * a_s[:, None] * b_s[None, :]
 
             # Advance pointers
             a_ptrs += BLOCK_SIZE_K
@@ -328,7 +327,7 @@ if _HAS_TRITON:
         a_s_k_blocks = tl.cdiv(K, input_block_size)
         a_s_ptrs = a_s_ptr + offs_m * a_s_k_blocks
         b_s_k_blocks = tl.cdiv(K, input_block_size)
-        b_s_base = b_s_ptr + pid_n * b_s_k_blocks
+        b_s_rows = offs_n // input_block_size
 
         # Accumulator
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
@@ -338,8 +337,8 @@ if _HAS_TRITON:
             k_start = k_idx * BLOCK_SIZE_K
 
             mask_k = offs_k < K - k_start
-            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0)
-            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0)
+            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
 
             a_f32 = a_fp8.to(tl.float32)
             b_f32 = b_fp8.to(tl.float32)
@@ -348,9 +347,9 @@ if _HAS_TRITON:
 
             k_scale_idx = k_start // input_block_size
             a_s = tl.load(a_s_ptrs + k_scale_idx)
-            b_s = tl.load(b_s_base + k_scale_idx)
+            b_s = tl.load(b_s_ptr + b_s_rows * b_s_k_blocks + k_scale_idx)
 
-            accumulator += dot_result * a_s[:, None] * b_s
+            accumulator += dot_result * a_s[:, None] * b_s[None, :]
 
             a_ptrs += BLOCK_SIZE_K
             b_ptrs += BLOCK_SIZE_K
@@ -487,8 +486,8 @@ if _HAS_TRITON:
             k_start = k_idx * BLOCK_SIZE_K
 
             mask_k = offs_k < K - k_start
-            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0)
-            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0)
+            a_fp8 = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+            b_fp8 = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
 
             a_f32 = a_fp8.to(tl.float32)
             b_f32 = b_fp8.to(tl.float32)

@@ -397,9 +397,9 @@ def convert_old_quants(state_dict, model_prefix="", metadata=None):
                 seen.add(layer_name)
 
                 weight = state_dict[k]
-                scale = state_dict.get(layer_name + ".weight_scale") or state_dict.get(
-                    layer_name + ".scale_weight"
-                )
+                scale = state_dict.get(layer_name + ".weight_scale")
+                if scale is None:
+                    scale = state_dict.get(layer_name + ".scale_weight")
                 scale_2 = state_dict.get(layer_name + ".weight_scale_2")
 
                 layer_conf = _infer_layer_format(weight, scale, scale_2)

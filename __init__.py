@@ -3,7 +3,6 @@ ComfyUI-QuantOps: Extended Quantization Layouts for ComfyUI
 
 This custom node extends ComfyUI's quantization system with additional layouts:
 - INT8 blockwise (with optional Triton acceleration)
-- INT8 tensorwise (uses torch._int_mm with dynamic activation quant)
 - Row-wise and Block-wise FP8 variants
 
 All layouts are lazy-loaded to avoid import errors when optional dependencies
@@ -11,6 +10,12 @@ All layouts are lazy-loaded to avoid import errors when optional dependencies
 """
 
 import logging
+
+import torch
+from comfy.quant_ops import QUANT_ALGOS, register_layout_class
+
+
+_NATIVE_COMFY_FORMATS = frozenset(QUANT_ALGOS)
 
 # =============================================================================
 # Module-level state for comfy-kitchen backend integration
@@ -33,8 +38,6 @@ def is_ck_triton_available() -> bool:
 def _setup_comfy_kitchen_backends():
     """
     Configure comfy-kitchen backends for QuantOps.
-
-    1. Re-enable triton backend (ComfyUI disables it by default)
     """
     global _CK_AVAILABLE, _CK_TRITON_AVAILABLE
 
@@ -47,23 +50,23 @@ def _setup_comfy_kitchen_backends():
         _CK_TRITON_AVAILABLE = False
         return
 
-    # Step 1: Re-enable triton backend (ComfyUI disables it)
     try:
-        ck.enable_backend("triton")
-
         backends = ck.list_backends()
         triton_info = backends.get("triton", {})
 
         if triton_info.get("available") and not triton_info.get("disabled"):
             _CK_TRITON_AVAILABLE = True
-            logging.info("ComfyUI-QuantOps: Enabled comfy-kitchen triton backend")
+            logging.info("ComfyUI-QuantOps: comfy-kitchen triton backend available")
+        elif triton_info.get("available"):
+            logging.info("ComfyUI-QuantOps: comfy-kitchen triton backend disabled")
+            _CK_TRITON_AVAILABLE = False
         else:
             unavail_reason = triton_info.get("unavailable_reason", "unknown")
             logging.info(f"ComfyUI-QuantOps: comfy-kitchen triton unavailable: {unavail_reason}")
             _CK_TRITON_AVAILABLE = False
 
     except Exception as e:
-        logging.warning(f"ComfyUI-QuantOps: Failed to enable ck triton backend: {e}")
+        logging.warning(f"ComfyUI-QuantOps: Failed to inspect ck triton backend: {e}")
         _CK_TRITON_AVAILABLE = False
 
 
@@ -75,37 +78,40 @@ def _setup_comfy_kitchen_backends():
 def _register_layouts():
     """Register our custom layouts into ComfyUI's layout registry and QUANT_ALGOS dict."""
     try:
-        from comfy.quant_ops import QUANT_ALGOS, register_layout_class
-        import torch
+        registered = []
+        if "int8_blockwise" not in QUANT_ALGOS:
+            from .quant_layouts.int8_layout import BlockWiseINT8Layout
 
-        # Import our layouts (this also registers their operation handlers)
-        from .quant_layouts.int8_layout import BlockWiseINT8Layout
-        from .quant_layouts.fp8_variants import RowWiseFP8Layout, BlockWiseFP8Layout
+            register_layout_class("BlockWiseINT8Layout", BlockWiseINT8Layout)
+            registered.append("BlockWiseINT8Layout")
+        if "float8_e4m3fn_rowwise" not in QUANT_ALGOS:
+            from .quant_layouts.fp8_variants import RowWiseFP8Layout
 
-        # Register layouts using the new comfy_kitchen API
-        register_layout_class("BlockWiseINT8Layout", BlockWiseINT8Layout)
-        register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
-        register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
+            register_layout_class("RowWiseFP8Layout", RowWiseFP8Layout)
+            registered.append("RowWiseFP8Layout")
+        if "float8_e4m3fn_blockwise" not in QUANT_ALGOS:
+            from .quant_layouts.fp8_variants import BlockWiseFP8Layout
 
-        # Tensorwise INT8 from comfy_kitchen
-        try:
-            from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
-            register_layout_class("TensorWiseINT8Layout", TensorWiseINT8Layout)
-            # Load our patch for per-channel scale support
-            from .quant_layouts import tensorwise_int8_layout
-            logging.info("ComfyUI-QuantOps: Registered TensorWiseINT8Layout")
-        except ImportError:
-            logging.debug("ComfyUI-QuantOps: TensorWiseINT8Layout not available")
+            register_layout_class("BlockWiseFP8Layout", BlockWiseFP8Layout)
+            registered.append("BlockWiseFP8Layout")
+
+        # Tensorwise INT8 is native in current ComfyUI. Only register it on
+        # older installs that do not already expose the format.
+        if "int8_tensorwise" not in QUANT_ALGOS:
+            try:
+                from comfy_kitchen.tensor.int8 import TensorWiseINT8Layout
+                register_layout_class("TensorWiseINT8Layout", TensorWiseINT8Layout)
+                QUANT_ALGOS["int8_tensorwise"] = {
+                    "storage_t": torch.int8,
+                    "parameters": {"weight_scale", "input_scale"},
+                    "comfy_tensor_layout": "TensorWiseINT8Layout",
+                }
+                registered.append("TensorWiseINT8Layout")
+                logging.info("ComfyUI-QuantOps: Registered TensorWiseINT8Layout")
+            except ImportError:
+                logging.debug("ComfyUI-QuantOps: TensorWiseINT8Layout not available")
 
         # Register QUANT_ALGOS
-        QUANT_ALGOS.setdefault(
-            "int8_tensorwise",
-            {
-                "storage_t": torch.int8,
-                "parameters": {"weight_scale", "input_scale"}, # Keep input_scale if checkpoints have it
-                "comfy_tensor_layout": "TensorWiseINT8Layout", # Must match the class name above
-            }
-        )
         QUANT_ALGOS.setdefault(
             "int8_blockwise",
             {
@@ -137,8 +143,10 @@ def _register_layouts():
         # MXFP8 from comfy_kitchen
         try:
             from comfy_kitchen.tensor import TensorCoreMXFP8Layout
-            register_layout_class("TensorCoreMXFP8Layout", TensorCoreMXFP8Layout)
-            logging.info("ComfyUI-QuantOps: Registered TensorCoreMXFP8Layout")
+            if "mxfp8" not in QUANT_ALGOS:
+                register_layout_class("TensorCoreMXFP8Layout", TensorCoreMXFP8Layout)
+                registered.append("TensorCoreMXFP8Layout")
+                logging.info("ComfyUI-QuantOps: Registered TensorCoreMXFP8Layout")
         except ImportError:
             logging.debug("ComfyUI-QuantOps: TensorCoreMXFP8Layout not available")
 
@@ -153,12 +161,14 @@ def _register_layouts():
         )
 
         # Hybrid MXFP8 from comfy_kitchen
-        try:
-            from comfy_kitchen.tensor import HybridMXFP8Layout
-            register_layout_class("HybridMXFP8Layout", HybridMXFP8Layout)
-            logging.info("ComfyUI-QuantOps: Registered HybridMXFP8Layout")
-        except ImportError:
-            logging.debug("ComfyUI-QuantOps: HybridMXFP8Layout not available")
+        if "hybrid_mxfp8" not in QUANT_ALGOS:
+            try:
+                from comfy_kitchen.tensor import HybridMXFP8Layout
+                register_layout_class("HybridMXFP8Layout", HybridMXFP8Layout)
+                registered.append("HybridMXFP8Layout")
+                logging.info("ComfyUI-QuantOps: Registered HybridMXFP8Layout")
+            except ImportError:
+                logging.debug("ComfyUI-QuantOps: HybridMXFP8Layout not available")
 
         QUANT_ALGOS.setdefault(
             "hybrid_mxfp8",
@@ -182,7 +192,6 @@ def _register_layouts():
         )
 
         # Verify registration
-        registered = ["BlockWiseINT8Layout", "TensorWiseINT8Layout", "RowWiseFP8Layout", "BlockWiseFP8Layout", "TensorCoreMXFP8Layout"]
         logging.info(f"ComfyUI-QuantOps: Registered layouts: {registered}")
 
     except Exception as e:
@@ -195,9 +204,33 @@ def _register_layouts():
 
 # Setup backends first (enables ck triton, registers our kernels)
 _setup_comfy_kitchen_backends()
+logging.info(
+    "ComfyUI-QuantOps diagnostic: native formats before extension: %s",
+    ", ".join(sorted(_NATIVE_COMFY_FORMATS)),
+)
 
 # Register layouts
 _register_layouts()
+logging.info(
+    "ComfyUI-QuantOps diagnostic: formats added to registry: %s",
+    ", ".join(sorted(set(QUANT_ALGOS) - _NATIVE_COMFY_FORMATS)) or "none",
+)
+
+# Patch stock ComfyUI loaders so QuantOps-only metadata works from normal loaders.
+try:
+    from .auto_patch import install_auto_patch
+
+    install_auto_patch(_NATIVE_COMFY_FORMATS)
+except Exception as e:
+    logging.warning(f"ComfyUI-QuantOps: failed to install stock-loader auto patch: {e}")
+
+# Extend an installed GGUF provider without replacing its loader implementation.
+try:
+    from .gguf_integration import install_gguf_integration
+
+    install_gguf_integration()
+except Exception as e:
+    logging.warning(f"ComfyUI-QuantOps: failed to install GGUF integration: {e}")
 
 # Import nodes for ComfyUI discovery
 from .nodes.loader_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
