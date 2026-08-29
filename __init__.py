@@ -202,6 +202,16 @@ _register_layouts()
 # Import nodes for ComfyUI discovery
 from .nodes.loader_nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
+from .nodes.lora_nodes import (
+    NODE_CLASS_MAPPINGS as LORA_NODE_CLASS_MAPPINGS,
+    NODE_DISPLAY_NAME_MAPPINGS as LORA_NODE_DISPLAY_NAME_MAPPINGS,
+)
+
+# Merge all node mappings
+NODE_CLASS_MAPPINGS.update(LORA_NODE_CLASS_MAPPINGS)
+NODE_DISPLAY_NAME_MAPPINGS.update(LORA_NODE_DISPLAY_NAME_MAPPINGS)
+
+
 __all__ = [
     "NODE_CLASS_MAPPINGS",
     "NODE_DISPLAY_NAME_MAPPINGS",
